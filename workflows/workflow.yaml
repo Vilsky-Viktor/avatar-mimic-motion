@@ -1,0 +1,45 @@
+main:
+  params: [args]
+  steps:
+    - ingest_job:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: projects/billion-ai-girls/locations/us-central1/jobs/ai-avatar-training-ingest-job
+          body:
+            overrides:
+              containerOverrides:
+                - name: ""
+                  env:
+                    - name: PAYLOAD
+                      value: ${json.encode_to_string(args)}
+                    - name: JOBS_BUCKET
+                      value: billion-ai-girls-jobs
+                    - name: EXECUTION_ID
+                      value: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+        result: ingest_execution
+    - preprocess-image-job:
+        call: googleapis.aiplatform.v1.projects.locations.customJobs.create
+        args:
+          parent: projects/billion-ai-girls/locations/us-central1
+          body:
+            displayName: ai-avatar-training-preprocess-image-job
+            jobSpec:
+              workerPoolSpecs:
+                - machineSpec:
+                    machineType: g2-standard-4
+                    acceleratorType: NVIDIA_L4
+                    acceleratorCount: 1
+                  replicaCount: 1
+                  diskSpec: {
+                    bootDiskType: pd-ssd,
+                    bootDiskSizeGb: 200
+                  }
+                  containerSpec:
+                    imageUri: gcr.io/billion-ai-girls/ai-avatar-training-preprocess-image-job:latest
+                    args: []
+                    env:
+                      - name: JOBS_BUCKET
+                        value: billion-ai-girls-jobs
+                      - name: EXECUTION_ID
+                        value: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+        result: preprocess_image_execution

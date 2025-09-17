@@ -1,0 +1,10 @@
+[tool.poetry]
+name = "ai-avatar-training-ingest-job"
+version = "0.1.0"
+description = "Ingest job for AI avatar training"
+authors = ["Viktor Vilskyi <viktor.vilskyi@gmail.com>"]
+packages = [{ include = "ingest_job" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+google-cloud-storage = "^2.14.0"
