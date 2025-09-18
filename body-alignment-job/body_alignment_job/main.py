@@ -1,6 +1,7 @@
 import os, json, subprocess, shlex, logging
 from pathlib import Path
 import numpy as np, torch
+import cv2
 
 from body_alignment_job.gcs_io import download_prefix, download_file, upload_tree
 from body_alignment_job.postprocess import find_demo_result_dir, map_outputs_to_crops, write_per_image_outputs, mean_betas_from_pkls
@@ -31,9 +32,14 @@ def load_manifest() -> dict:
 
 def ensure_models_from_bucket():
     # SMPLest-X pretrained
+    log.info("downloading smplest_x models")
     download_file(JOBS_BUCKET, f"models/smplest_x/smplest_x_h.pth.tar", PRETRAINED / "smplest_x_h.pth.tar")
     download_file(JOBS_BUCKET, f"models/smplest_x/config_base.py", PRETRAINED / "config_base.py")
 
+    log.info("downloading vitpose model")
+    download_file(JOBS_BUCKET, f"models/vitpose/vitpose_huge.pth", PRETRAINED / "vitpose_huge.pth")
+
+    log.info("downloading SMPLX models")
     # SMPL-X (minimum neutral npz + common aux files)
     (HUMAN_MODELS / "smplx").mkdir(parents=True, exist_ok=True)
     for fn in [
@@ -46,14 +52,39 @@ def ensure_models_from_bucket():
         except Exception:
             pass
 
+    log.info("downloading SMPL models")
+    (HUMAN_MODELS / "smpl").mkdir(parents=True, exist_ok=True)
+    for fn in [
+        "SMPL_FEMALE.pkl", "SMPL_MALE.pkl", "SMPL_NEUTRAL.pkl"
+    ]:
+        try:
+            download_file(JOBS_BUCKET, f"models/smpl/{fn}", HUMAN_MODELS / "smpl" / fn)
+        except Exception:
+            pass
+
 def make_video_from_crops(crops: list[Path], out_mp4: Path, fps: int):
-    seq = WORK / "seq"; seq.mkdir(parents=True, exist_ok=True)
+    seq = WORK / "seq"
+    seq.mkdir(parents=True, exist_ok=True)
+    # clean
+    for f in seq.glob("*"): f.unlink()
+
+    # copy crops → numbered jpg
     for i, p in enumerate(crops, 1):
-        link = seq / f"{i:06d}.png"
-        if link.exists(): link.unlink()
-        os.symlink(p, link)
-    cmd = f'ffmpeg -y -r {fps} -i {seq}/%06d.png -c:v libx264 -pix_fmt yuv420p -crf 0 {out_mp4}'
-    subprocess.check_call(shlex.split(cmd))
+        img = cv2.imread(str(p))
+        dst = seq / f"{i:06d}.jpg"
+        cv2.imwrite(str(dst), img)
+
+    # ensure output directory exists
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-r", str(fps),
+        "-i", str(seq / "%06d.jpg"),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+        str(out_mp4)
+    ]
+    subprocess.check_call(cmd)
 
 def run_smplest_inference(video_path: Path, fps: int):
     # README: put the file under SMPLest-X/demo and call scripts/inference.sh
@@ -66,14 +97,14 @@ def run_smplest_inference(video_path: Path, fps: int):
     subprocess.check_call(cmd, shell=True)
 
 def main():
-    print("downloading manifest ...")
+    log.info("downloading manifest ...")
     manifest = load_manifest()
     avatar_id = manifest["ai_avatar_id"]
     log.info(f"[BodyAlignment] avatar_id={avatar_id}")
 
     # 1) data
     
-    print("downloading identity photos ...")
+    log.info("downloading identity photos ...")
     crops = download_prefix(
         JOBS_BUCKET,
         f"ai_avatars/{avatar_id}/identity_images",
@@ -83,37 +114,37 @@ def main():
     if not crops: raise RuntimeError("Avatar photos found")
     log.info(f"Downloaded {len(crops)} images")
 
-    # 2) models
-    print("downloading models ...")
-    ensure_models_from_bucket()
-
-    # 3) make mp4
-    print("composing video from photos ...")
+    # 2) make mp4
+    log.info("composing video from photos ...")
     mp4 = WORK / f"{avatar_id}_bodycrops.mp4"
     make_video_from_crops(crops, mp4, FPS)
 
+    # 3) models
+    log.info("downloading models ...")
+    ensure_models_from_bucket()
+
     # 4) run SMPLest-X official inference
-    print("running smplest inference ...")
+    log.info("running smplest inference ...")
     run_smplest_inference(mp4, FPS)
 
     # 5) collect outputs → map to images
-    print("mapping outputs and images ...")
+    log.info("mapping outputs and images ...")
     result_dir = find_demo_result_dir(REPO, mp4.name)
     pkls = map_outputs_to_crops(result_dir, crops)
 
-    print("writing results ...")
+    log.info("writing results ...")
     OUT.mkdir(parents=True, exist_ok=True)
     write_per_image_outputs(OUT, crops, pkls, overlays_dir=result_dir)
 
     # 6) aggregate shape → T-pose mesh
-    print("calculating canonical body ...")
+    log.info("calculating canonical body ...")
     betas = mean_betas_from_pkls(pkls)
     torch.save(torch.tensor(betas, dtype=torch.float32), OUT / "body_shape.pt")
     mesh = tpose_mesh_from_betas(HUMAN_MODELS, betas, gender="neutral")
     save_mesh(mesh, OUT / "canonical_body.obj")
 
     # 7) upload
-    print("uploading results to bucket ...")
+    log.info("uploading results to bucket ...")
     dst = f"ai_avatars/{avatar_id}/aligned/body"
     upload_tree(JOBS_BUCKET, OUT, dst)
     log.info(f"Uploaded to gs://{JOBS_BUCKET}/{dst}/")

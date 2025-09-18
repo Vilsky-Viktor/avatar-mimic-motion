@@ -6,14 +6,16 @@ authors = ["Viktor Vilskyi <viktor.vilskyi@gmail.com>"]
 packages = [{ include = "body_alignment_job" }]
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.11"
-google-cloud-storage = "^2.18.0"
-numpy = "^1.26.4"
-opencv-python = "^4.10.0"
-tqdm = "^4.66.5"
+python = ">=3.9,<3.10"
+google-cloud-storage = "^2.18.2"
+numpy = "1.23.5"                  # 1.24+ drops 3.9 support
+scipy = "1.9.3"                   # useful for smplx, last Py3.9 line
 trimesh = "^4.4.3"
+tqdm = "^4.66.5"
+opencv-python = "4.8.1.78"        # 4.10+ requires Python 3.10
+Pillow = "^10.0.0"                 # <11 to stay 3.9-compatible
 smplx = "^0.1.28"
 
 [build-system]
-requires = ["poetry-core>=1.8.0"]
+requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "avatar-dwpose-job"
+version = "0.1.0"
+description = "Generate DWPose keypoints for AI avatar training"
+authors = ["Your Name <you@example.com>"]
+packages = [{ include = "avatar_pose_job" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+torch = "2.0.1"
+torchvision = "0.15.2"
+torchaudio = "2.0.2"
+Pillow = "^10.0.0"
+google-cloud-storage = "^2.17.0"
+opencv-python = "^4.8.0"
+mmpose = "^1.3.1"
+mmcv = "^2.1.0"

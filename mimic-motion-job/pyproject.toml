@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "mimic-motion-job"
+version = "0.1.0"
+description = "Runs Tencent MimicMotion with a generated config that mirrors configs/test.yaml"
+authors = ["Viktor Vilskyi <viktor.vilskyi@gmail.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.12"
+google-cloud-storage = "^2.18.0"
+PyYAML = "^6.0.2"
+opencv-python = "^4.10.0"
+numpy = "<2"
+huggingface-hub = "0.21.0"
+matplotlib = "^3.9.2"
+onnxruntime-gpu = {version = "1.19.2", markers = "sys_platform == 'linux'"}
+accelerate = "^0.34.2"
+av = "^10.0.0"
+
+[build-system]
+requires = ["poetry-core>=1.9"]
+build-backend = "poetry.core.masonry.api"

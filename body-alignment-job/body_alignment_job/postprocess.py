@@ -1,5 +1,6 @@
 from pathlib import Path
 import pickle, shutil, numpy as np
+from typing import Optional
 
 def find_demo_result_dir(repo_root: Path, video_file: str) -> Path:
     # SMPLest-X README: "Inference output will be saved in SMPLest-X/demo"
@@ -13,7 +14,12 @@ def map_outputs_to_crops(result_dir: Path, crops: list[Path]):
         pkls = pkls[:len(crops)]
     return pkls
 
-def write_per_image_outputs(out_dir: Path, crops: list[Path], pkls: list[Path], overlays_dir: Path | None):
+def write_per_image_outputs(
+    out_dir: Path,
+    crops: list[Path],
+    pkls: list[Path],
+    overlays_dir: Optional[Path]
+):
     out_dir.mkdir(parents=True, exist_ok=True)
     demo_imgs = sorted(list(overlays_dir.rglob("*.png"))) if overlays_dir else []
     for i, crop in enumerate(crops):

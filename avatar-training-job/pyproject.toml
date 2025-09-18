@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "avatar-training-job"
+version = "0.1.0"
+description = "LoRA fine-tuning job for MimicMotion UNet"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{ include = "avatar_training_job" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+torch = "2.0.1"
+torchvision = "0.15.2"
+torchaudio = "2.0.2"
+diffusers = "0.27.0"
+transformers = "^4.32.1"
+peft = "^0.10.0"
+accelerate = "^0.30.0"
+google-cloud-storage = "^2.17.0"
+Pillow = "^10.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
