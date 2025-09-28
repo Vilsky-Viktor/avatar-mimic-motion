@@ -130,21 +130,37 @@ print(f"LAMBDA_ID {LAMBDA_ID}")
 # Helpers
 # =============================================================================
 
-class ZeroAddEmbedding(torch.nn.Module):
-    """
-    Safe, deterministic replacement for mismatched add_embedding.
-    Returns zeros of the time-embedding size, so residuals stay consistent.
-    """
-    def __init__(self, out_features: int):
+class _LinearProbe(torch.nn.Module):
+    def __init__(self, in_features: int, out_features: int):
         super().__init__()
-        self.register_buffer("_dev", torch.tensor(0.0), persistent=False)
-        self.out_features = out_features
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # never used; just here to satisfy nn.Module
         return torch.zeros((x.shape[0], self.out_features), device=x.device, dtype=x.dtype)
 
+class ZeroAddEmbedding(torch.nn.Module):
+    """
+    A no-op add_embedding that:
+    - returns zeros with shape [B, time_dim] so it can be added to time_embeds
+    - exposes `.linear_1.in_features` for pipeline introspection
+    """
+    def __init__(self, in_features: int, time_out_features: int):
+        super().__init__()
+        self.linear_1 = _LinearProbe(in_features, time_out_features)   # exposes `.in_features`
+        self.linear_2 = _LinearProbe(time_out_features, time_out_features)
 
-def maybe_neutralize_add_embedding(unet) -> bool:
+    def forward(self, time_embeds: torch.Tensor) -> torch.Tensor:
+        # match UNet’s expected add-embed output: [B, time_dim]
+        return torch.zeros(
+            (time_embeds.shape[0], self.linear_2.out_features),
+            device=time_embeds.device,
+            dtype=time_embeds.dtype,
+        )
+
+
+def maybe_neutralize_add_embedding(unet, accelerator) -> bool:
     """
     Only neutralize add_embedding if the checkpoint's module expects a different
     input size than the runtime will feed (time_dim + addition_time_embed_dim).
@@ -166,7 +182,15 @@ def maybe_neutralize_add_embedding(unet) -> bool:
 
         if needs_patch:
             print(f"[FIX] add_embedding input mismatch: expects {in_feat}, runtime feeds {expected_in}. Neutralizing add_embedding.")
-            unet.add_embedding = ZeroAddEmbedding(time_dim)
+            proj_in = int(getattr(u.config, "projection_class_embeddings_input_dim", 768))     # from your UNet config
+            time_dim = int(u.time_embedding.linear_2.out_features)                              # typically 1280
+            print(f"[FIX] Installing ZeroAddEmbedding: in_features={proj_in}, time_dim={time_dim}")
+            unet.add_embedding = ZeroAddEmbedding(in_features=proj_in, time_out_features=time_dim).to(
+                device=accelerator.device,
+                dtype=(torch.bfloat16 if accelerator.mixed_precision == "bf16"
+                    else torch.float16 if accelerator.mixed_precision == "fp16"
+                    else torch.float32),
+            )
             unet.config.addition_time_embed_dim = 0
             if hasattr(unet, "addition_time_embed_dim"):
                 setattr(unet, "addition_time_embed_dim", 0)
@@ -379,7 +403,7 @@ def main():
     face_paths = ensure_local_dataset(bkt, f"ai_avatars/{AI_AVATAR_ID}/face_crops", LOCAL_DATA / "faces", (".png", ".jpg", ".jpeg"))
     body_paths = ensure_local_dataset(bkt, f"ai_avatars/{AI_AVATAR_ID}/body_crops", LOCAL_DATA / "bodies", (".png", ".jpg", ".jpeg"))
 
-    ds = SVDDataset(body_paths)
+    ds = SVDDataset(body_paths + face_paths)
     dl = DataLoader(
         ds,
         batch_size=BATCH_SIZE,
@@ -414,7 +438,7 @@ def main():
         print(f"[WARN] gradient checkpointing not enabled: {e}")
 
     # Patch ONLY if needed (shape mismatch)
-    maybe_neutralize_add_embedding(pipe.unet)
+    maybe_neutralize_add_embedding(pipe.unet, accelerator)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=ACC_STEPS,
