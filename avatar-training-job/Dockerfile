@@ -77,6 +77,6 @@ ENV TORCH_HOME=/root/.cache/torch
 ENV HF_HUB_DISABLE_TELEMETRY=1
 ENV INSIGHTFACE_ONNX_PROVIDERS="CUDAExecutionProvider,CPUExecutionProvider"
 # Optional: mitigate CUDA memory fragmentation (safe to leave commented)
-ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32,expandable_segments:True
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9
 
 ENTRYPOINT ["python", "-m", "avatar_training_job.main"]
