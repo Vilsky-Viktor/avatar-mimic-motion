@@ -39,34 +39,6 @@ gcloud ai custom-jobs create \
             {
               "name": "TARGET_MODEL_NAME",
               "value": "white-socks"
-            },
-            {
-              "name": "BATCH_SIZE",
-              "value": "1"
-            },
-            {
-              "name": "LR",
-              "value": "1e-4"
-            },
-            {
-              "name": "WD",
-              "value": "0"
-            },
-            {
-              "name": "EPOCHS",
-              "value": "12"
-            },
-            {
-              "name": "WARMUP_STEPS",
-              "value": "60"
-            },
-            {
-              "name": "ACC_STEPS",
-              "value": "2"
-            },
-            {
-              "name": "NUM_FRAMES",
-              "value": "14"
             }
           ]
         }

@@ -84,46 +84,67 @@ for d in (LOCAL_DATA, LOCAL_MODELS, LOCAL_OUT):
     d.mkdir(parents=True, exist_ok=True)
 
 # =============================================================================
-# Hyperparams (Pulled from ENV with Defaults)
+# Hyperparams — tuned for ~280 images & tight VRAM (1 microbatch)
 # =============================================================================
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
-ACC_STEPS = int(os.getenv("ACC_STEPS", "2"))
-EPOCHS = int(os.getenv("EPOCHS", "12"))
-LR = float(os.getenv("LR", "1e-4"))
-WD = float(os.getenv("WD", "0"))
-WARMUP_STEPS = int(os.getenv("WARMUP_STEPS", "60"))
-RESTARTS = int(os.getenv("RESTARTS", "1"))
-MAX_STEPS = int(os.getenv("MAX_STEPS", "0"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))             # <= memory bound: 1 “bucket”
+ACC_STEPS  = int(os.getenv("ACC_STEPS",  "6"))             # keep effective update quality
+EPOCHS     = int(os.getenv("EPOCHS",     "50"))            # bounded by MAX_STEPS
+LR         = float(os.getenv("LR",       "5e-5"))
+WD         = float(os.getenv("WD",       "0.01"))
+WARMUP_STEPS = int(os.getenv("WARMUP_STEPS", "300"))
+RESTARTS     = int(os.getenv("RESTARTS",     "1"))
+MAX_STEPS    = int(os.getenv("MAX_STEPS",    "3000"))      # ~3k optimizer updates
 
-# Video generation quality
-NUM_FRAMES = int(os.getenv("NUM_FRAMES", "14"))
-ARC_FACE_NUM_FRAMES = int(os.getenv("ARC_FACE_NUM_FRAMES", "3"))
+# DataLoader workers (0 for minimal RAM usage)
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "0"))
+
+# Video / train shape
+NUM_FRAMES          = int(os.getenv("NUM_FRAMES", "14"))
+ARC_FACE_NUM_FRAMES = int(os.getenv("ARC_FACE_NUM_FRAMES", "4"))
 FPS = int(os.getenv("FPS", "6"))
 TARGET_H = 1024
 TARGET_W = 576
 
-# LoRA detail and strength
-LORA_RANK = int(os.getenv("LORA_RANK", "16"))
+# LoRA capacity/strength
+LORA_RANK  = int(os.getenv("LORA_RANK",  "32"))
 LORA_ALPHA = float(os.getenv("LORA_ALPHA", "32.0"))
 
-# Identity and motion control
-LAMBDA_ID = float(os.getenv("LAMBDA_ID", "0.25"))
-MOTION_BUCKET_ID = int(os.getenv("MOTION_BUCKET_ID", "127"))
-NOISE_AUG_STRENGTH = float(os.getenv("NOISE_AUG_STRENGTH", "0.02"))
+# Identity & motion control
+LAMBDA_ID         = float(os.getenv("LAMBDA_ID", "0.3"))        # max weight (ramped)
+ID_WARMUP_STEPS   = int(os.getenv("ID_WARMUP_STEPS", "800"))
+MOTION_BUCKET_ID  = int(os.getenv("MOTION_BUCKET_ID", "120"))
+NOISE_AUG_STRENGTH= float(os.getenv("NOISE_AUG_STRENGTH", "0.015"))
+
+# Temporal consistency
+TEMP_LOSS_W = float(os.getenv("TEMP_LOSS_W", "0.02"))
+
+# Mid-range timestep sampling fractions
+MID_TS_LOW_FRAC  = float(os.getenv("MID_TS_LOW_FRAC",  "0.20"))
+MID_TS_HIGH_FRAC = float(os.getenv("MID_TS_HIGH_FRAC", "0.85"))
+
+# EMA on LoRA params
+EMA_DECAY = float(os.getenv("EMA_DECAY", "0.999"))
 
 # Precision (A100: bf16; otherwise fp16)
 MIXED_PRECISION = os.getenv("MIXED_PRECISION", "bf16")  # "bf16", "fp16", or "no"
 
+# Low-VRAM toggles for safety
+LOW_VRAM = os.getenv("LOW_VRAM", "1") == "1"  # enable attention slicing & VAE tiling by default
+
 print(f"BATCH_SIZE {BATCH_SIZE}")
+print(f"ACC_STEPS {ACC_STEPS}")
 print(f"EPOCHS {EPOCHS}")
 print(f"LR {LR}")
 print(f"WD {WD}")
-print(f"ACC_STEPS {ACC_STEPS}")
 print(f"LORA_RANK {LORA_RANK}")
 print(f"LORA_ALPHA {LORA_ALPHA}")
 print(f"NUM_FRAMES {NUM_FRAMES}")
 print(f"WARMUP_STEPS {WARMUP_STEPS}")
-print(f"LAMBDA_ID {LAMBDA_ID}")
+print(f"LAMBDA_ID {LAMBDA_ID} (warmup {ID_WARMUP_STEPS})")
+print(f"TEMP_LOSS_W {TEMP_LOSS_W}")
+print(f"MID_TS window [{MID_TS_LOW_FRAC:.2f}, {MID_TS_HIGH_FRAC:.2f}]")
+print(f"EMA_DECAY {EMA_DECAY}")
+print(f"NUM_WORKERS {NUM_WORKERS}  LOW_VRAM {LOW_VRAM}")
 
 
 # =============================================================================
@@ -137,7 +158,6 @@ class _LinearProbe(torch.nn.Module):
         self.out_features = int(out_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # never used; just here to satisfy nn.Module
         return torch.zeros((x.shape[0], self.out_features), device=x.device, dtype=x.dtype)
 
 class ZeroAddEmbedding(torch.nn.Module):
@@ -152,7 +172,6 @@ class ZeroAddEmbedding(torch.nn.Module):
         self.linear_2 = _LinearProbe(time_out_features, time_out_features)
 
     def forward(self, time_embeds: torch.Tensor) -> torch.Tensor:
-        # match UNet’s expected add-embed output: [B, time_dim]
         return torch.zeros(
             (time_embeds.shape[0], self.linear_2.out_features),
             device=time_embeds.device,
@@ -160,9 +179,9 @@ class ZeroAddEmbedding(torch.nn.Module):
         )
 
 
-def maybe_neutralize_add_embedding(unet, accelerator) -> bool:
+def maybe_neutralize_add_embedding(unet, device, dtype) -> bool:
     """
-    Only neutralize add_embedding if the checkpoint's module expects a different
+    Only neutralize add_embedding if the checkpoint expects a different
     input size than the runtime will feed (time_dim + addition_time_embed_dim).
     Returns True if patched.
     """
@@ -182,14 +201,10 @@ def maybe_neutralize_add_embedding(unet, accelerator) -> bool:
 
         if needs_patch:
             print(f"[FIX] add_embedding input mismatch: expects {in_feat}, runtime feeds {expected_in}. Neutralizing add_embedding.")
-            proj_in = int(getattr(u.config, "projection_class_embeddings_input_dim", 768))     # from your UNet config
-            time_dim = int(u.time_embedding.linear_2.out_features)                              # typically 1280
+            proj_in = int(getattr(unet.config, "projection_class_embeddings_input_dim", 768))
             print(f"[FIX] Installing ZeroAddEmbedding: in_features={proj_in}, time_dim={time_dim}")
-            unet.add_embedding = ZeroAddEmbedding(in_features=proj_in, time_out_features=time_dim).to(
-                device=accelerator.device,
-                dtype=(torch.bfloat16 if accelerator.mixed_precision == "bf16"
-                    else torch.float16 if accelerator.mixed_precision == "fp16"
-                    else torch.float32),
+            unet.add_embedding = ZeroAddEmbedding(in_features=proj_in, time_out_features=int(time_dim)).to(
+                device=device, dtype=dtype
             )
             unet.config.addition_time_embed_dim = 0
             if hasattr(unet, "addition_time_embed_dim"):
@@ -219,8 +234,7 @@ def load_and_prepare_bgr_image(path: Path) -> Optional[np.ndarray]:
 
 def inject_lora_safe(unet, r: int, alpha: float):
     """
-    LoRA injection compatible with diffusers 0.24.x:
-    Prefer the attn_processors mapping when available.
+    LoRA injection compatible with diffusers 0.24.x: prefer attn_processors mapping.
     """
     use_sdpa = hasattr(F, "scaled_dot_product_attention")
     LORA_CLS = LoRAAttnProcessor2_0 if use_sdpa else LoRAAttnProcessor
@@ -230,7 +244,6 @@ def inject_lora_safe(unet, r: int, alpha: float):
     if isinstance(attn_map, dict) and len(attn_map) > 0:
         attn_procs = {}
         for name in attn_map.keys():
-            # Deduce hidden size by block
             if name.startswith("mid_block"):
                 hidden_size = unet.config.block_out_channels[-1]
             elif name.startswith("up_blocks"):
@@ -241,7 +254,6 @@ def inject_lora_safe(unet, r: int, alpha: float):
                 hidden_size = unet.config.block_out_channels[block_id]
             else:
                 continue
-            # attn1 is self-attn (no cross), attn2 is cross-attn
             cross_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
             attn_procs[name] = LORA_CLS(
                 hidden_size=hidden_size,
@@ -275,7 +287,7 @@ def save_lora_weights(unet, out_path: Path):
             for p_name, p in sd.items():
                 state[f"{name}.{p_name}"] = p.detach().cpu()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     st.save_file(state, str(out_path))
     print(f"[LoRA] Saved {len(state)} tensors → {out_path}")
 
@@ -294,8 +306,7 @@ def build_added_time_ids(b: int, latents_hw, fps, motion_bucket_id, noise_aug_st
 
 def fix_group_norm_channels(unet):
     """
-    Generic and safe GN patcher for the first down block’s resnets.
-    Avoids importing internal block classes (keeps 0.24 happy).
+    Safe GN patcher for first down block’s resnets (avoids internal class imports).
     """
     try:
         down_blocks = getattr(unet, "down_blocks", None)
@@ -321,7 +332,6 @@ def fix_group_norm_channels(unet):
             else:
                 continue
 
-            # norm1
             if hasattr(inner, "norm1") and isinstance(inner.norm1, nn.GroupNorm):
                 old = inner.norm1
                 if old.num_channels != expected:
@@ -338,7 +348,6 @@ def fix_group_norm_channels(unet):
                     print(f"[GROUPNORM-FIX] Applied patch to down_blocks[0].resnets[{i}] norm1 (Channels={expected}).")
                     patched += 1
 
-            # norm2
             if hasattr(inner, "norm2") and isinstance(inner.norm2, nn.GroupNorm):
                 old2 = inner.norm2
                 if old2.num_channels != expected:
@@ -375,10 +384,39 @@ def collect_lora_parameters(unet):
             params += list(proc.parameters())
     return params
 
+
 def _worker_init_fn(worker_id):
     base = torch.initial_seed() % 2**32
     np.random.seed(base + worker_id)
     random.seed(base + worker_id)
+
+
+# ---------------- EMA helpers (for LoRA params) ----------------
+def build_ema_shadow(params):
+    # build on the SAME device/dtype as params
+    return [p.detach().clone().to(p.device, dtype=p.dtype) for p in params]
+
+@torch.no_grad()
+def ema_update(shadow, params, decay: float):
+    for s, p in zip(shadow, params):
+        # safety: align device/dtype in case something changed
+        if s.device != p.device or s.dtype != p.dtype:
+            s.data = s.data.to(p.device, dtype=p.dtype)
+        s.mul_(decay).add_(p.detach(), alpha=1.0 - decay)
+
+@torch.no_grad()
+def swap_to_ema(params, shadow):
+    backup = [p.detach().clone() for p in params]
+    for p, s in zip(params, shadow):
+        if p.device != s.device or p.dtype != s.dtype:
+            s = s.to(p.device, dtype=p.dtype)
+        p.copy_(s)
+    return backup
+
+@torch.no_grad()
+def restore_from_backup(params, backup):
+    for p, b in zip(params, backup):
+        p.copy_(b)
 
 
 # =============================================================================
@@ -389,7 +427,6 @@ def main():
     random.seed(0); np.random.seed(0); torch.manual_seed(0)
     torch.backends.cudnn.benchmark = True
     if torch.cuda.is_available():
-        # TF32 can speed up training on Ampere+ without hurting quality here
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
@@ -397,22 +434,36 @@ def main():
     import diffusers as _df
     print("[ENV] diffusers", _df.__version__)  # expect 0.24.x
 
+    # Accelerator first (we use its device/dtype for patches)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=ACC_STEPS,
+        mixed_precision=MIXED_PRECISION if torch.cuda.is_available() else "no",
+    )
+    device = accelerator.device
+    mp_dtype = (
+        torch.bfloat16 if accelerator.mixed_precision == "bf16"
+        else torch.float16 if accelerator.mixed_precision == "fp16"
+        else torch.float32
+    )
+
     bkt = gcs_bucket(BUCKET)
 
-    # 1) Dataset
+    # 1) Dataset (combine body + face crops)
     face_paths = ensure_local_dataset(bkt, f"ai_avatars/{AI_AVATAR_ID}/face_crops", LOCAL_DATA / "faces", (".png", ".jpg", ".jpeg"))
     body_paths = ensure_local_dataset(bkt, f"ai_avatars/{AI_AVATAR_ID}/body_crops", LOCAL_DATA / "bodies", (".png", ".jpg", ".jpeg"))
 
-    ds = SVDDataset(body_paths + face_paths)
+    all_paths = body_paths + face_paths
+    print(f"[DATA] body={len(body_paths)} face={len(face_paths)} total={len(all_paths)}")
+    ds = SVDDataset(all_paths)
     dl = DataLoader(
         ds,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
-        pin_memory=True,
+        num_workers=NUM_WORKERS,                 # <= memory-friendly
+        pin_memory=(torch.cuda.is_available()),
         drop_last=True,
-        persistent_workers=True if 2 > 0 else False,
-        worker_init_fn=_worker_init_fn
+        persistent_workers=(NUM_WORKERS > 0),    # False when NUM_WORKERS=0
+        worker_init_fn=_worker_init_fn if NUM_WORKERS > 0 else None
     )
 
     # 2) Model
@@ -427,31 +478,31 @@ def main():
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
     )
 
-    # memory knobs
-    try:
-        pipe.enable_xformers_memory_efficient_attention()
-    except Exception as e:
-        print(f"[WARN] xFormers not enabled: {e}")
+    # Try memory knobs
     try:
         pipe.unet.enable_gradient_checkpointing()
     except Exception as e:
         print(f"[WARN] gradient checkpointing not enabled: {e}")
+    if LOW_VRAM:
+        try:
+            pipe.enable_attention_slicing("max")
+            print("[MEM] Enabled attention slicing (‘max’).")
+        except Exception as e:
+            print(f"[WARN] attention slicing not enabled: {e}")
+        try:
+            pipe.enable_vae_tiling()
+            print("[MEM] Enabled VAE tiling.")
+        except Exception as e:
+            print(f"[WARN] VAE tiling not enabled: {e}")
+    else:
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("[MEM] Enabled xFormers attention.")
+        except Exception as e:
+            print(f"[WARN] xFormers not enabled: {e}")
 
     # Patch ONLY if needed (shape mismatch)
-    maybe_neutralize_add_embedding(pipe.unet, accelerator)
-
-    accelerator = Accelerator(
-        gradient_accumulation_steps=ACC_STEPS,
-        mixed_precision=MIXED_PRECISION if torch.cuda.is_available() else "no",
-    )
-    device = accelerator.device
-
-    # dtype to use everywhere
-    mp_dtype = (
-        torch.bfloat16 if accelerator.mixed_precision == "bf16"
-        else torch.float16 if accelerator.mixed_precision == "fp16"
-        else torch.float32
-    )
+    maybe_neutralize_add_embedding(pipe.unet, device=device, dtype=mp_dtype)
 
     # Move submodules
     pipe.vae = pipe.vae.to(device, dtype=mp_dtype)
@@ -495,18 +546,35 @@ def main():
     total_train_steps = MAX_STEPS if MAX_STEPS > 0 else (math.ceil(len(dl) / ACC_STEPS) * EPOCHS)
     lr_sched = get_cosine_with_hard_restarts_schedule_with_warmup(opt, WARMUP_STEPS, total_train_steps, RESTARTS)
 
+    # Accelerator prepare (opt & dataloader & sched)
     opt, dl, lr_sched = accelerator.prepare(opt, dl, lr_sched)
+
+    # Move UNet AFTER prepare and build EMA shadow on-device
     pipe.unet = pipe.unet.to(device)
     pipe.unet.train()
+
+    # EMA shadow (now created on the correct device/dtype)
+    ema_shadow = build_ema_shadow(trainable_params)
+    print(f"[EMA] Shadow built on device={ema_shadow[0].device}, dtype={ema_shadow[0].dtype}")
 
     # Cross-attn context: zeros (SVD img->vid expects context tensor of size cross_attention_dim)
     cross_dim = int(getattr(pipe.unet.config, "cross_attention_dim", 0))
     if cross_dim <= 0:
         raise RuntimeError(f"Invalid cross_attention_dim={cross_dim} (must be > 0 for SVD).")
 
+    # Print a quick plan
+    est_updates = math.ceil(len(dl) / ACC_STEPS) * EPOCHS if MAX_STEPS == 0 else MAX_STEPS
+    print(f"[PLAN] batches/epoch={len(dl)} acc_steps={ACC_STEPS} epochs={EPOCHS} ⇒ planned_updates≈{est_updates}")
+
     global_step = 0
 
     for epoch in range(EPOCHS):
+        # Safety: keep EMA on the same device/dtype as current params
+        if ema_shadow and (ema_shadow[0].device != trainable_params[0].device or ema_shadow[0].dtype != trainable_params[0].dtype):
+            for i, p in enumerate(trainable_params):
+                ema_shadow[i] = ema_shadow[i].to(p.device, dtype=p.dtype)
+            print(f"[EMA] Realigned shadow → device={trainable_params[0].device}, dtype={trainable_params[0].dtype}")
+
         dl_iter = tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
         for step, batch in enumerate(dl_iter):
@@ -538,12 +606,17 @@ def main():
                         b, c, lh, lw = cond_latent.shape
                         _dprint(f"[DBG] cond_latent: shape={tuple(cond_latent.shape)}, scaling_factor={pipe.vae.config.scaling_factor}")
 
-                        # Timesteps: one per sequence
+                        # Timesteps: mid-range sampling
                         base_ts = pipe.scheduler.timesteps.to(cond_latent.device)
-                        t_seq = base_ts[torch.randint(0, base_ts.numel(), (b,), device=cond_latent.device)]  # [B]
-                        t_per_frame = t_seq.repeat_interleave(NUM_FRAMES)  # [B*F]
-                        _dprint(f"[DBG] timesteps: base_len={base_ts.numel()}, t_seq.shape={tuple(t_seq.shape)}, "
-                                f"t_per_frame.shape={tuple(t_per_frame.shape)}, t_seq[:min(4,b)]={t_seq[:min(4,b)].tolist()}")
+                        lo = int(MID_TS_LOW_FRAC * base_ts.numel()); hi = int(MID_TS_HIGH_FRAC * base_ts.numel())
+                        lo = max(0, min(lo, base_ts.numel() - 1))
+                        hi = max(lo + 1, min(hi, base_ts.numel()))
+                        idx = torch.randint(lo, hi, (b,), device=cond_latent.device)
+                        t_seq = base_ts[idx]                              # [B]
+                        t_per_frame = t_seq.repeat_interleave(NUM_FRAMES) # [B*F]
+                        _dprint(f"[DBG] timesteps: base_len={base_ts.numel()}, range=[{lo},{hi}), "
+                                f"t_seq.shape={tuple(t_seq.shape)}, t_per_frame.shape={tuple(t_per_frame.shape)}, "
+                                f"t_seq[:min(4,b)]={t_seq[:min(4,b)].tolist()}")
 
                         # Replicate latents across frames
                         target_latents = (
@@ -609,10 +682,13 @@ def main():
                 model_pred_noise = model_pred[:, :4]    # predicted noise
                 loss_recon = F.mse_loss(model_pred_noise.float(), noise.float())
 
+                # Temporal loss (adjacent-frame smoothness on predicted noise)
+                mp = model_pred_noise.view(b, NUM_FRAMES, 4, h, w)
+                temp_loss = F.mse_loss(mp[:, 1:], mp[:, :-1])
+
                 # Identity loss (random subset of frames)
                 total_id_loss = torch.tensor(0.0, device=device)
                 if arc.is_ready and LAMBDA_ID > 0:
-                    print('Processing ArcFace on random frames')
                     with torch.no_grad():
                         for i in range(b):
                             frame_indices = random.sample(range(NUM_FRAMES), ARC_FACE_NUM_FRAMES)
@@ -634,82 +710,127 @@ def main():
                                     id_sim = cosine_sim(emb, anchor_emb)
                                     total_id_loss += (1.0 - id_sim)
 
-                    id_loss_avg = (total_id_loss / max(b * ARC_FACE_NUM_FRAMES, 1)) * LAMBDA_ID
+                    id_loss_avg = (total_id_loss / max(b * ARC_FACE_NUM_FRAMES, 1))
                 else:
                     id_loss_avg = torch.tensor(0.0, device=device)
 
-                loss = loss_recon + id_loss_avg
+                # Identity weight ramp
+                curr_id_w = LAMBDA_ID * min(1.0, global_step / max(1, ID_WARMUP_STEPS))
+                # Total loss
+                loss = loss_recon + (curr_id_w * id_loss_avg) + (TEMP_LOSS_W * temp_loss)
+
                 accelerator.backward(loss)
 
+                grad_norm = None
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable_params, 1.0)
+                    # monitor grad norm (debug)
+                    sqsum = 0.0
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            sqsum += float(p.grad.data.float().pow(2).sum().item())
+                    grad_norm = math.sqrt(sqsum) if sqsum > 0 else 0.0
 
                 opt.step()
                 lr_sched.step()
                 opt.zero_grad()
 
+                # EMA update after param step (devices aligned in ema_update)
+                ema_update(ema_shadow, trainable_params, EMA_DECAY)
+
             global_step += 1
-            if accelerator.is_main_process and global_step % 50 == 0:
-                sim_display = 1.0 - (total_id_loss.item() / max(b, 1)) if b > 0 else 0.0
-                dl_iter.set_postfix(Recon=float(loss_recon.item()), ID_Sim=float(sim_display), Loss=float(loss.item()))
+
+            # ----- Per-step logs (every step) -----
+            if accelerator.is_main_process:
+                curr_lr = lr_sched.get_last_lr()[0] if hasattr(lr_sched, "get_last_lr") else opt.param_groups[0]["lr"]
+                mem_alloc = mem_reserved = 0.0
+                if torch.cuda.is_available():
+                    mem_alloc = torch.cuda.memory_allocated() / (1024**2)
+                    mem_reserved = torch.cuda.memory_reserved() / (1024**2)
+
+                sim = 1.0 - float(id_loss_avg.item())
+                id_contrib   = curr_id_w * float(id_loss_avg.item())
+                temp_contrib = TEMP_LOSS_W * float(temp_loss.item())
+
+                print(
+                    f"[STEP] e={epoch+1} s={global_step} "
+                    f"lr={curr_lr:.2e} "
+                    f"recon={float(loss_recon.item()):.6f} "
+                    f"id_dist={float(id_loss_avg.item()):.6f} sim={sim:.3f} id_w={curr_id_w:.3f} id_term={id_contrib:.6f} "
+                    f"temp={float(temp_loss.item()):.6f} temp_term={temp_contrib:.6f} "
+                    f"total={float(loss.item()):.6f} "
+                    f"grad={(0.0 if grad_norm is None else float(grad_norm)):.3f} "
+                    f"mem={mem_alloc:.0f}/{mem_reserved:.0f}MB"
+                )
 
             if MAX_STEPS > 0 and global_step >= MAX_STEPS:
                 break
 
-        # 5) Save checkpoint per epoch
+        # 5) Save checkpoint per epoch (EMA weights)
         if accelerator.is_main_process:
-            ckpt = LOCAL_OUT / f"{TARGET_MODEL_NAME}_epoch{epoch+1}.safetensors"
-            save_lora_weights(accelerator.unwrap_model(pipe.unet), ckpt)
-            upload_file(bkt, f"{OUT_PREFIX}/{ckpt.name}", ckpt, content_type="application/octet-stream")
+            # Temporarily swap in EMA params for saving
+            backup = swap_to_ema(trainable_params, ema_shadow)
+            try:
+                ckpt = LOCAL_OUT / f"{TARGET_MODEL_NAME}_epoch{epoch+1}.safetensors"
+                save_lora_weights(accelerator.unwrap_model(pipe.unet), ckpt)
+                upload_file(bkt, f"{OUT_PREFIX}/{ckpt.name}", ckpt, content_type="application/octet-stream")
+            finally:
+                restore_from_backup(trainable_params, backup)
 
         if MAX_STEPS > 0 and global_step >= MAX_STEPS:
             break
 
-    # 6) Final save & Test generation
+    # 6) Final save & Test generation (with EMA)
     if accelerator.is_main_process:
-        final_w = LOCAL_OUT / f"{TARGET_MODEL_NAME}.safetensors"
-        save_lora_weights(accelerator.unwrap_model(pipe.unet), final_w)
-        upload_file(bkt, f"{OUT_PREFIX}/{final_w.name}", final_w, content_type="application/octet-stream")
+        # Swap in EMA for final export & test
+        backup = swap_to_ema(trainable_params, ema_shadow)
+        try:
+            final_w = LOCAL_OUT / f"{TARGET_MODEL_NAME}.safetensors"
+            save_lora_weights(accelerator.unwrap_model(pipe.unet), final_w)
+            upload_file(bkt, f"{OUT_PREFIX}/{final_w.name}", final_w, content_type="application/octet-stream")
 
-        test_cond = load_and_prepare_bgr_image(LOCAL_DATA / "bodies" / "identity.png")
-        if test_cond is None:
-            print("WARNING: Skipping test generation due to missing/empty identity.png.")
-        else:
-            # Prep test image (BGR->RGB->PIL)
-            test_rgb = cv2.cvtColor(test_cond, cv2.COLOR_BGR2RGB)
-            test_image_pil = Image.fromarray(test_rgb)
+            test_cond = load_and_prepare_bgr_image(LOCAL_DATA / "bodies" / "identity.png")
+            if test_cond is None:
+                print("WARNING: Skipping test generation due to missing/empty identity.png.")
+            else:
+                # Prep test image (BGR->RGB->PIL)
+                test_rgb = cv2.cvtColor(test_cond, cv2.COLOR_BGR2RGB)
+                test_image_pil = Image.fromarray(test_rgb)
 
-            # Move ALL pipeline parts to the SAME device + dtype
-            pipe.to(accelerator.device)
-            infer_dtype = next(pipe.unet.parameters()).dtype  # e.g. torch.float16 or bfloat16
-            pipe.to(torch_dtype=infer_dtype)
-            if getattr(pipe, "image_encoder", None) is not None:
-                pipe.image_encoder.to(accelerator.device, dtype=infer_dtype).eval()
-            if getattr(pipe, "vae", None) is not None:
-                pipe.vae.to(accelerator.device, dtype=infer_dtype).eval()
-            pipe.unet.eval()
+                # Move ALL pipeline parts to the SAME device + dtype
+                pipe.to(accelerator.device)
+                infer_dtype = next(pipe.unet.parameters()).dtype  # e.g. torch.float16 or bfloat16
+                pipe.to(torch_dtype=infer_dtype)
+                if getattr(pipe, "image_encoder", None) is not None:
+                    pipe.image_encoder.to(accelerator.device, dtype=infer_dtype).eval()
+                if getattr(pipe, "vae", None) is not None:
+                    pipe.vae.to(accelerator.device, dtype=infer_dtype).eval()
+                pipe.unet.eval()
 
-            use_amp = (accelerator.device.type == "cuda" and infer_dtype in (torch.float16, torch.bfloat16))
-            amp = torch.autocast("cuda", dtype=infer_dtype) if use_amp else nullcontext()
+                use_amp = (accelerator.device.type == "cuda" and infer_dtype in (torch.float16, torch.bfloat16))
+                amp = torch.autocast("cuda", dtype=infer_dtype) if use_amp else nullcontext()
 
-            gen = torch.Generator(device="cpu").manual_seed(42)
+                gen = torch.Generator(device="cpu").manual_seed(42)
 
-            with torch.inference_mode(), amp:
-                result = pipe(
-                    image=test_image_pil,
-                    num_frames=NUM_FRAMES,
-                    decode_chunk_size=4,
-                    fps=FPS,
-                    height=TARGET_H,
-                    width=TARGET_W,
-                    generator=gen,
-                )
-                frames = result.frames[0]
+                with torch.inference_mode(), amp:
+                    result = pipe(
+                        image=test_image_pil,
+                        num_frames=NUM_FRAMES,
+                        decode_chunk_size=2 if LOW_VRAM else 4,   # smaller chunk in low VRAM
+                        fps=FPS,
+                        height=TARGET_H,
+                        width=TARGET_W,
+                        generator=gen,
+                    )
+                    frames = result.frames[0]
 
-            test_video = LOCAL_OUT / f"{TARGET_MODEL_NAME}.mp4"
-            frames_np = [np.array(f) for f in frames]
-            iio.imwrite(test_video, frames_np, fps=FPS, codec="h264", quality=8)
-            upload_file(bkt, f"{OUT_PREFIX}/{test_video.name}", test_video, content_type="video/mp4")
+                test_video = LOCAL_OUT / f"{TARGET_MODEL_NAME}.mp4"
+                frames_np = [np.array(f) for f in frames]
+                iio.imwrite(test_video, frames_np, fps=FPS, codec="h264", quality=8)
+                upload_file(bkt, f"{OUT_PREFIX}/{test_video.name}", test_video, content_type="video/mp4")
+        finally:
+            # Restore train-time params (tidy)
+            restore_from_backup(trainable_params, backup)
 
         print(f"[DONE] Training finished. Final files uploaded to gs://{BUCKET}/{OUT_PREFIX}")
 
