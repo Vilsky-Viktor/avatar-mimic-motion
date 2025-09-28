@@ -3,7 +3,6 @@ import random
 from pathlib import Path
 import math
 from typing import Optional
-import bitsandbytes as bnb
 from contextlib import nullcontext
 
 import torch
@@ -87,12 +86,12 @@ for d in (LOCAL_DATA, LOCAL_MODELS, LOCAL_OUT):
 # =============================================================================
 # Hyperparams (Pulled from ENV with Defaults)
 # =============================================================================
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))         
-ACC_STEPS = int(os.getenv("ACC_STEPS", "2")) 
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
+ACC_STEPS = int(os.getenv("ACC_STEPS", "2"))
 EPOCHS = int(os.getenv("EPOCHS", "12"))
-LR = float(os.getenv("LR", "1e-4")) 
+LR = float(os.getenv("LR", "1e-4"))
 WD = float(os.getenv("WD", "0"))
-WARMUP_STEPS = int(os.getenv("WARMUP_STEPS", "60")) 
+WARMUP_STEPS = int(os.getenv("WARMUP_STEPS", "60"))
 RESTARTS = int(os.getenv("RESTARTS", "1"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "0"))
 
@@ -104,16 +103,16 @@ TARGET_H = 1024
 TARGET_W = 576
 
 # LoRA detail and strength
-LORA_RANK = int(os.getenv("LORA_RANK", "16"))  
-LORA_ALPHA = float(os.getenv("LORA_ALPHA", "32.0")) 
+LORA_RANK = int(os.getenv("LORA_RANK", "16"))
+LORA_ALPHA = float(os.getenv("LORA_ALPHA", "32.0"))
 
 # Identity and motion control
 LAMBDA_ID = float(os.getenv("LAMBDA_ID", "0.25"))
 MOTION_BUCKET_ID = int(os.getenv("MOTION_BUCKET_ID", "127"))
 NOISE_AUG_STRENGTH = float(os.getenv("NOISE_AUG_STRENGTH", "0.02"))
 
-# A100-specific hardware optimization 🧠
-MIXED_PRECISION = os.getenv("MIXED_PRECISION", "bf16") 
+# Precision (A100: bf16; otherwise fp16)
+MIXED_PRECISION = os.getenv("MIXED_PRECISION", "bf16")  # "bf16", "fp16", or "no"
 
 print(f"BATCH_SIZE {BATCH_SIZE}")
 print(f"EPOCHS {EPOCHS}")
@@ -126,30 +125,62 @@ print(f"NUM_FRAMES {NUM_FRAMES}")
 print(f"WARMUP_STEPS {WARMUP_STEPS}")
 print(f"LAMBDA_ID {LAMBDA_ID}")
 
+
 # =============================================================================
 # Helpers
 # =============================================================================
 
-# ---- START: DEFINITIVE FIX (PART 1) ----
-# Define a proper nn.Module to replace the faulty one.
-# This satisfies PyTorch's requirement that assigned modules must be nn.Module subclasses.
-class DummyModule(torch.nn.Module):
-    def __init__(self, output_dim):
+class ZeroAddEmbedding(torch.nn.Module):
+    """
+    Safe, deterministic replacement for mismatched add_embedding.
+    Returns zeros of the time-embedding size, so residuals stay consistent.
+    """
+    def __init__(self, out_features: int):
         super().__init__()
-        # This parameter ensures the module is moved to the correct device
-        # along with the parent UNet (e.g., with .to('cuda')).
-        self.dummy_param = torch.nn.Parameter(torch.empty(0))
-        self.output_dim = output_dim
+        self.register_buffer("_dev", torch.tensor(0.0), persistent=False)
+        self.out_features = out_features
 
-    def forward(self, x):
-        # Return a zero tensor with the correct batch size, output dimension,
-        # device, and dtype.
-        return torch.zeros(
-            (x.shape[0], self.output_dim),
-            device=self.dummy_param.device,
-            dtype=x.dtype
-        )
-# ---- END: DEFINITIVE FIX (PART 1) ----
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.zeros((x.shape[0], self.out_features), device=x.device, dtype=x.dtype)
+
+
+def maybe_neutralize_add_embedding(unet) -> bool:
+    """
+    Only neutralize add_embedding if the checkpoint's module expects a different
+    input size than the runtime will feed (time_dim + addition_time_embed_dim).
+    Returns True if patched.
+    """
+    try:
+        time_dim = unet.time_embedding.linear_2.out_features  # usually 1280
+        add_dim = int(getattr(unet.config, "addition_time_embed_dim", 0) or 0)
+        lin1 = getattr(getattr(unet, "add_embedding", None), "linear_1", None)
+        in_feat = lin1.in_features if lin1 is not None else None
+
+        print(f"[CHK] add_embedding.linear_1.in_features: {in_feat}")
+        print(f"[CHK] time_embedding.linear_2.out_features: {time_dim}")
+        print(f"[CHK] addition_time_embed_dim (cfg): {add_dim}")
+        print(f"[CHK] projection_class_embeddings_input_dim (cfg): {getattr(unet.config, 'projection_class_embeddings_input_dim', None)}")
+
+        expected_in = time_dim + add_dim
+        needs_patch = in_feat is not None and in_feat != expected_in
+
+        if needs_patch:
+            print(f"[FIX] add_embedding input mismatch: expects {in_feat}, runtime feeds {expected_in}. Neutralizing add_embedding.")
+            unet.add_embedding = ZeroAddEmbedding(time_dim)
+            unet.config.addition_time_embed_dim = 0
+            if hasattr(unet, "addition_time_embed_dim"):
+                setattr(unet, "addition_time_embed_dim", 0)
+            for p in unet.add_embedding.parameters():
+                p.requires_grad = False
+            print("[FIX] add_embedding neutralized; addition_time_embed_dim set to 0.")
+            return True
+        else:
+            print("[OK] add_embedding dimensions are consistent.")
+            return False
+    except Exception as e:
+        print(f"[WARN] add_embedding check failed (continuing unpatched): {e}")
+        return False
+
 
 def load_and_prepare_bgr_image(path: Path) -> Optional[np.ndarray]:
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -165,7 +196,7 @@ def load_and_prepare_bgr_image(path: Path) -> Optional[np.ndarray]:
 def inject_lora_safe(unet, r: int, alpha: float):
     """
     LoRA injection compatible with diffusers 0.24.x:
-    Prefer the attn_processors mapping when available (it is in 0.24).
+    Prefer the attn_processors mapping when available.
     """
     use_sdpa = hasattr(F, "scaled_dot_product_attention")
     LORA_CLS = LoRAAttnProcessor2_0 if use_sdpa else LoRAAttnProcessor
@@ -205,7 +236,6 @@ def inject_lora_safe(unet, r: int, alpha: float):
 def save_lora_weights(unet, out_path: Path):
     """
     Save LoRA weights by iterating over attention processors mapping.
-    This is version-agnostic and does not rely on Attention class imports.
     """
     procs = getattr(unet, "attn_processors", None)
     if not isinstance(procs, dict) or len(procs) == 0:
@@ -221,7 +251,7 @@ def save_lora_weights(unet, out_path: Path):
             for p_name, p in sd.items():
                 state[f"{name}.{p_name}"] = p.detach().cpu()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True    )
     st.save_file(state, str(out_path))
     print(f"[LoRA] Saved {len(state)} tensors → {out_path}")
 
@@ -241,7 +271,7 @@ def build_added_time_ids(b: int, latents_hw, fps, motion_bucket_id, noise_aug_st
 def fix_group_norm_channels(unet):
     """
     Generic and safe GN patcher for the first down block’s resnets.
-    We do NOT rely on importing specific block classes (keeps 0.24 happy).
+    Avoids importing internal block classes (keeps 0.24 happy).
     """
     try:
         down_blocks = getattr(unet, "down_blocks", None)
@@ -277,7 +307,6 @@ def fix_group_norm_channels(unet):
                         eps=old.eps,
                         affine=True,
                     )
-                    # Copy weights if shapes match
                     if new.weight.shape == old.weight.shape:
                         new.weight.data.copy_(old.weight.data)
                         new.bias.data.copy_(old.bias.data)
@@ -322,12 +351,24 @@ def collect_lora_parameters(unet):
             params += list(proc.parameters())
     return params
 
+def _worker_init_fn(worker_id):
+    base = torch.initial_seed() % 2**32
+    np.random.seed(base + worker_id)
+    random.seed(base + worker_id)
+
 
 # =============================================================================
 # Main
 # =============================================================================
 def main():
+    # Repro + perf knobs
     random.seed(0); np.random.seed(0); torch.manual_seed(0)
+    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        # TF32 can speed up training on Ampere+ without hurting quality here
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     print("[ENV] torch", torch.__version__)
     import diffusers as _df
     print("[ENV] diffusers", _df.__version__)  # expect 0.24.x
@@ -338,6 +379,18 @@ def main():
     face_paths = ensure_local_dataset(bkt, f"ai_avatars/{AI_AVATAR_ID}/face_crops", LOCAL_DATA / "faces", (".png", ".jpg", ".jpeg"))
     body_paths = ensure_local_dataset(bkt, f"ai_avatars/{AI_AVATAR_ID}/body_crops", LOCAL_DATA / "bodies", (".png", ".jpg", ".jpeg"))
 
+    ds = SVDDataset(body_paths)
+    dl = DataLoader(
+        ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True if 2 > 0 else False,
+        worker_init_fn=_worker_init_fn
+    )
+
     # 2) Model
     local_model_dir = LOCAL_MODELS / "svd_1_1"
     if local_model_dir.exists():
@@ -345,41 +398,23 @@ def main():
     local_model_dir.mkdir(parents=True, exist_ok=True)
     download_folder(bkt, BASE_MODEL_PREFIX, local_model_dir)
 
-    # 3) ArcFace anchor
-    arc = ArcFaceID()
-    anchor_emb = torch.zeros(512, dtype=torch.float32)
-    if arc.is_ready:
-        anchor_img = load_and_prepare_bgr_image(LOCAL_DATA / "faces" / "identity.png")
-        if anchor_img is not None:
-            with torch.inference_mode():
-                anchor_emb_tmp = arc.embed_bgr(anchor_img)
-            if anchor_emb_tmp is not None:
-                anchor_emb = anchor_emb_tmp / (anchor_emb_tmp.norm(p=2) + 1e-8)
-            else:
-                print("WARNING: ArcFace could not detect a face in identity.png.")
-        else:
-            print("WARNING: identity.png not found or empty.")
-
-    ds = SVDDataset(body_paths)
-    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
-
-    # 4) Pipeline & accelerator
     pipe = StableVideoDiffusionPipeline.from_pretrained(
         str(local_model_dir),
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
     )
 
-    pipe.enable_xformers_memory_efficient_attention()
-    pipe.unet.enable_gradient_checkpointing()
+    # memory knobs
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception as e:
+        print(f"[WARN] xFormers not enabled: {e}")
+    try:
+        pipe.unet.enable_gradient_checkpointing()
+    except Exception as e:
+        print(f"[WARN] gradient checkpointing not enabled: {e}")
 
-    # ---- START: DEFINITIVE FIX (PART 2) ----
-    if hasattr(pipe.unet, "add_embedding") and pipe.unet.add_embedding is not None:
-        print("[FIX] Replacing conflicting 'add_embedding' module with a proper DummyModule.")
-        # The output of add_embedding is added to the time embedding. We get its dimension.
-        output_dim = pipe.unet.time_embedding.linear_2.out_features
-        # Instantiate the dummy module and assign it.
-        pipe.unet.add_embedding = DummyModule(output_dim)
-    # ---- END: DEFINITIVE FIX (PART 2) ----
+    # Patch ONLY if needed (shape mismatch)
+    maybe_neutralize_add_embedding(pipe.unet)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=ACC_STEPS,
@@ -387,12 +422,33 @@ def main():
     )
     device = accelerator.device
 
-    want_bf16 = (accelerator.mixed_precision == "bf16")
-    mp_dtype = torch.bfloat16 if want_bf16 else (torch.float16 if accelerator.mixed_precision == "fp16" else torch.float32)
-    pipe.vae = pipe.vae.to(device, dtype=mp_dtype)
-    anchor_emb = anchor_emb.to(device)
+    # dtype to use everywhere
+    mp_dtype = (
+        torch.bfloat16 if accelerator.mixed_precision == "bf16"
+        else torch.float16 if accelerator.mixed_precision == "fp16"
+        else torch.float32
+    )
 
-    # Sanity: print UNet embedding config (should show 768 in_features for 0.24 snapshot)
+    # Move submodules
+    pipe.vae = pipe.vae.to(device, dtype=mp_dtype)
+
+    # 3) ArcFace anchor
+    arc = ArcFaceID()
+    anchor_emb = torch.zeros(512, dtype=torch.float32, device=device)
+    if arc.is_ready:
+        anchor_img = load_and_prepare_bgr_image(LOCAL_DATA / "faces" / "identity.png")
+        if anchor_img is not None:
+            with torch.inference_mode():
+                emb_tmp = arc.embed_bgr(anchor_img)
+            if emb_tmp is not None:
+                emb_tmp = emb_tmp.to(device)
+                anchor_emb = emb_tmp / (emb_tmp.norm(p=2) + 1e-8)
+            else:
+                print("WARNING: ArcFace could not detect a face in identity.png.")
+        else:
+            print("WARNING: identity.png not found or empty.")
+
+    # Sanity: print UNet embedding config
     u = pipe.unet
     try:
         print("[CHK] add_embedding is callable:", callable(getattr(u, "add_embedding", None)))
@@ -419,7 +475,7 @@ def main():
     pipe.unet = pipe.unet.to(device)
     pipe.unet.train()
 
-    # Cross-attn context: zeros (SVD img->vid still expects context tensor of size cross_attention_dim)
+    # Cross-attn context: zeros (SVD img->vid expects context tensor of size cross_attention_dim)
     cross_dim = int(getattr(pipe.unet.config, "cross_attention_dim", 0))
     if cross_dim <= 0:
         raise RuntimeError(f"Invalid cross_attention_dim={cross_dim} (must be > 0 for SVD).")
@@ -446,9 +502,9 @@ def main():
                     _dprint(f"[DBG] bodies: shape={tuple(bodies.shape)}, dtype={bodies.dtype}, "
                             f"min={int(bodies.min()) if bodies.numel() else 'NA'} max={int(bodies.max()) if bodies.numel() else 'NA'}")
 
-                    # BGR -> RGB, CHW, [0,1], move to device
+                    # BGR -> RGB, CHW, [0,1], move to device/dtype
                     cond_rgb = bodies[..., [2, 1, 0]].to(device).float().div_(255.0)
-                    cond_rgb = cond_rgb.permute(0, 3, 1, 2).to(dtype=vae_dtype)
+                    cond_rgb = cond_rgb.permute(0, 3, 1, 2).to(dtype=mp_dtype)
                     _dprint(f"[DBG] cond_rgb: shape={tuple(cond_rgb.shape)}, dtype={cond_rgb.dtype}, device={cond_rgb.device}")
 
                     # -------------------- Latents & noise --------------------
@@ -502,7 +558,7 @@ def main():
                     _dprint(f"[DBG] added_time_ids: shape={tuple(added_time_ids.shape)}, sample[0]={added_time_ids[0].tolist()}")
 
                     # -------------------- UNet forward (diffusers 0.24.x) --------------------
-                    with torch.autocast(device.type, enabled=accelerator.mixed_precision == MIXED_PRECISION):
+                    with torch.autocast(device_type=device.type, dtype=mp_dtype, enabled=(accelerator.mixed_precision != "no")):
                         out = pipe.unet(
                             noisy_latents,                 # [B,F,8,H/8,W/8]
                             t_seq,                         # [B]
@@ -513,7 +569,6 @@ def main():
 
                 except Exception as e:
                     _dprint(f"[ERR] Exception in forward: {repr(e)}")
-                    # Helpful structural prints:
                     try:
                         _dprint(f"[ERR] unet.config.addition_time_embed_dim={getattr(pipe.unet.config,'addition_time_embed_dim',None)}")
                         _dprint(f"[ERR] projection_class_embeddings_input_dim={getattr(pipe.unet.config,'projection_class_embeddings_input_dim',None)}")
@@ -530,20 +585,17 @@ def main():
                 model_pred_noise = model_pred[:, :4]    # predicted noise
                 loss_recon = F.mse_loss(model_pred_noise.float(), noise.float())
 
-                # Identity loss (optional, on a random subset of frames for balance)
+                # Identity loss (random subset of frames)
                 total_id_loss = torch.tensor(0.0, device=device)
                 if arc.is_ready and LAMBDA_ID > 0:
                     print('Processing ArcFace on random frames')
                     with torch.no_grad():
-                        for i in range(b):  # use actual batch size
-                            # Select a random sample of frame indices for the current sequence
+                        for i in range(b):
                             frame_indices = random.sample(range(NUM_FRAMES), ARC_FACE_NUM_FRAMES)
-
-                            # Loop over the randomly selected frames
                             for j in frame_indices:
-                                frame_idx = i * NUM_FRAMES + j
-                                target_latent_ij = target_latents[frame_idx].unsqueeze(0)
-                                model_pred_ij = model_pred_noise[frame_idx].unsqueeze(0)
+                                idx = i * NUM_FRAMES + j
+                                target_latent_ij = target_latents[idx].unsqueeze(0)
+                                model_pred_ij = model_pred_noise[idx].unsqueeze(0)
 
                                 rec_latent = target_latent_ij - model_pred_ij
                                 rec = pipe.vae.decode(rec_latent / pipe.vae.config.scaling_factor, num_frames=1).sample
@@ -558,7 +610,6 @@ def main():
                                     id_sim = cosine_sim(emb, anchor_emb)
                                     total_id_loss += (1.0 - id_sim)
 
-                    # Average the loss over the number of frames that were actually checked
                     id_loss_avg = (total_id_loss / max(b * ARC_FACE_NUM_FRAMES, 1)) * LAMBDA_ID
                 else:
                     id_loss_avg = torch.tensor(0.0, device=device)
@@ -604,27 +655,21 @@ def main():
             test_rgb = cv2.cvtColor(test_cond, cv2.COLOR_BGR2RGB)
             test_image_pil = Image.fromarray(test_rgb)
 
-            # --- Move ALL pipeline parts to the SAME device + dtype ---
+            # Move ALL pipeline parts to the SAME device + dtype
             pipe.to(accelerator.device)
-            infer_dtype = next(pipe.unet.parameters()).dtype  # e.g. torch.float16 on CUDA
+            infer_dtype = next(pipe.unet.parameters()).dtype  # e.g. torch.float16 or bfloat16
             pipe.to(torch_dtype=infer_dtype)
-            # Ensure image encoder is not left on CPU half
             if getattr(pipe, "image_encoder", None) is not None:
-                pipe.image_encoder.to(accelerator.device, dtype=infer_dtype)
-                pipe.image_encoder.eval()
+                pipe.image_encoder.to(accelerator.device, dtype=infer_dtype).eval()
             if getattr(pipe, "vae", None) is not None:
-                pipe.vae.to(accelerator.device, dtype=infer_dtype)
-                pipe.vae.eval()
+                pipe.vae.to(accelerator.device, dtype=infer_dtype).eval()
             pipe.unet.eval()
 
-            # AMP only on CUDA and only for half/bfloat16
             use_amp = (accelerator.device.type == "cuda" and infer_dtype in (torch.float16, torch.bfloat16))
             amp = torch.autocast("cuda", dtype=infer_dtype) if use_amp else nullcontext()
 
-            # Optional: deterministic generator (CPU to match SVD’s noise init)
             gen = torch.Generator(device="cpu").manual_seed(42)
 
-            # If you want the portrait test to match your crops (576x1024), pass height/width
             with torch.inference_mode(), amp:
                 result = pipe(
                     image=test_image_pil,
@@ -637,7 +682,6 @@ def main():
                 )
                 frames = result.frames[0]
 
-            # Save MP4 (ensure numpy arrays)
             test_video = LOCAL_OUT / f"{TARGET_MODEL_NAME}.mp4"
             frames_np = [np.array(f) for f in frames]
             iio.imwrite(test_video, frames_np, fps=FPS, codec="h264", quality=8)
