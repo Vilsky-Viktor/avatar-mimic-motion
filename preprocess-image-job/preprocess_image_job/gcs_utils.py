@@ -1,5 +1,6 @@
 import io, json, cv2, numpy as np
 from google.cloud import storage
+from pathlib import Path
 
 def get_client():
     return storage.Client()
@@ -28,3 +29,20 @@ def upload_png(bucket, path, img):
         raise RuntimeError("Encode failed")
     
     bucket.blob(path).upload_from_file(io.BytesIO(buf.tobytes()), content_type="image/png")
+
+def download_folder(bucket, blob_prefix: str, local_dir: Path):
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    for blob in bucket.list_blobs(prefix=blob_prefix):
+        if blob.name.endswith("/"):
+            continue
+
+        rel = Path(blob.name).relative_to(blob_prefix)
+        dst = local_dir / rel
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not dst.exists():
+            print(f"[GCS] Downloading {blob.name} -> {dst}")
+            blob.download_to_filename(str(dst))
+        else:
+            print(f"[GCS] Skipping (exists): {dst}")

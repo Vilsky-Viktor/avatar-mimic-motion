@@ -1,20 +1,27 @@
 [tool.poetry]
 name = "ai-avatar-training-preprocess-image-job"
-version = "0.1.0"
-description = "Raw image preprocessing for ai avatar training"
+version = "0.2.0"
+description = "Raw image preprocessing for AI avatar training (with RMBG-2.0)"
 authors = ["Viktor Vilskyi <viktor.vilskyi@gmail.com>"]
 packages = [{ include = "preprocess_image_job" }]
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.10,<3.11"
 google-cloud-storage = "^3.3.1"
-opencv-python-headless = "^4.9.0"
+opencv-python-headless = "^4.10.0.84"
 numpy = "^1.26.4"
 Pillow = "^10.4.0"
-torch = "^2.2.0"
-torchvision = "^0.17.0"
+torch = "^2.3.0"
+torchvision = "^0.18.0"
 ultralytics = "^8.3.0"
 retina-face = "^0.0.17"
+huggingface-hub = "^0.23.0"
+transformers = "^4.44.0"
+accelerate = "^0.33.0"
+safetensors = "^0.4.5"
+tf-keras = "^2.15.1"
+timm = "^1.0.9"
+kornia = "^0.7.2"
 
 [build-system]
 requires = ["poetry-core"]
