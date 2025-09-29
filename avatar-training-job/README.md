@@ -39,6 +39,14 @@ gcloud ai custom-jobs create \
             {
               "name": "TARGET_MODEL_NAME",
               "value": "white-socks"
+            },
+            {
+              "name": "DEBUG_SVD",
+              "value": "0"
+            },
+            {
+              "name": "ID_LATENT_DOWNSCALE",
+              "value": "2"
             }
           ]
         }

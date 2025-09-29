@@ -1,3 +1,4 @@
+# main.py
 import os
 import random
 from pathlib import Path
@@ -9,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.checkpoint import checkpoint as ckpt
 
 import numpy as np
 import cv2
@@ -33,7 +35,7 @@ from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProc
 
 from accelerate import Accelerator
 
-from avatar_training_job.arcface_utils import ArcFaceID, cosine_sim
+from avatar_training_job.arcface_utils import ArcFaceID
 from avatar_training_job.dataset import SVDDataset
 
 
@@ -84,43 +86,40 @@ for d in (LOCAL_DATA, LOCAL_MODELS, LOCAL_OUT):
     d.mkdir(parents=True, exist_ok=True)
 
 # =============================================================================
-# Hyperparams (ENV defaults tuned for ~280 crops total)
+# Hyperparams
 # =============================================================================
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))          # keep memory safe
-ACC_STEPS  = int(os.getenv("ACC_STEPS", "4"))           # effective batch ~4
-EPOCHS     = int(os.getenv("EPOCHS", "50"))             # longer, small LR
-LR         = float(os.getenv("LR", "4e-5"))             # conservative for LoRA
-WD         = float(os.getenv("WD", "0.0"))
-WARMUP_STEPS = int(os.getenv("WARMUP_STEPS", "1000"))
-RESTARTS     = int(os.getenv("RESTARTS", "1"))
-MAX_STEPS    = int(os.getenv("MAX_STEPS", "0"))
+BATCH_SIZE    = int(os.getenv("BATCH_SIZE", "1"))
+ACC_STEPS     = int(os.getenv("ACC_STEPS", "8"))         # was 4
+EPOCHS        = int(os.getenv("EPOCHS", "50"))
+LR            = float(os.getenv("LR", "3e-5"))           # was 4e-5
+WD            = float(os.getenv("WD", "0.01"))           # was 0.0
+WARMUP_STEPS  = int(os.getenv("WARMUP_STEPS", "500"))
+RESTARTS      = int(os.getenv("RESTARTS", "1"))
+MAX_STEPS     = int(os.getenv("MAX_STEPS", "0"))
 
-# Video generation quality
-NUM_FRAMES = int(os.getenv("NUM_FRAMES", "14"))
-ARC_FACE_NUM_FRAMES = int(os.getenv("ARC_FACE_NUM_FRAMES", "3"))
-FPS = int(os.getenv("FPS", "6"))
-TARGET_H = int(os.getenv("TARGET_H", "1024"))
-TARGET_W = int(os.getenv("TARGET_W", "576"))
+NUM_FRAMES             = int(os.getenv("NUM_FRAMES", "14"))
+ARC_FACE_NUM_FRAMES    = int(os.getenv("ARC_FACE_NUM_FRAMES", "3"))
+FPS                    = int(os.getenv("FPS", "6"))
+TARGET_H               = int(os.getenv("TARGET_H", "1024"))
+TARGET_W               = int(os.getenv("TARGET_W", "576"))
 
-# LoRA detail and strength
-LORA_RANK  = int(os.getenv("LORA_RANK", "32"))
-LORA_ALPHA = float(os.getenv("LORA_ALPHA", "64.0"))
+LORA_RANK   = int(os.getenv("LORA_RANK", "32"))
+LORA_ALPHA  = float(os.getenv("LORA_ALPHA", "32.0"))      # was 64.0
 
-# Identity and motion control (single motion bucket to save memory)
-LAMBDA_ID = float(os.getenv("LAMBDA_ID", "0.25"))
-MOTION_BUCKET_ID = int(os.getenv("MOTION_BUCKET_ID", "120"))
-NOISE_AUG_STRENGTH = float(os.getenv("NOISE_AUG_STRENGTH", "0.012"))
+LAMBDA_ID           = float(os.getenv("LAMBDA_ID", "0.25"))
+MOTION_BUCKET_ID    = int(os.getenv("MOTION_BUCKET_ID", "120"))
+NOISE_AUG_STRENGTH  = float(os.getenv("NOISE_AUG_STRENGTH", "0.012"))
 
-# Timestep training window (keep mid-range to reduce instability)
 TS_MIN = int(os.getenv("TS_MIN", "200"))
 TS_MAX = int(os.getenv("TS_MAX", "900"))
 
-# Precision (A100: bf16; otherwise fp16)
-MIXED_PRECISION = os.getenv("MIXED_PRECISION", "bf16")  # "bf16", "fp16", or "no"
+MIXED_PRECISION = os.getenv("MIXED_PRECISION", "bf16")     # "bf16", "fp16", or "no"
 
-# EMA
-USE_EMA = os.getenv("USE_EMA", "1") == "1"
+USE_EMA   = os.getenv("USE_EMA", "1") == "1"
 EMA_DECAY = float(os.getenv("EMA_DECAY", "0.9995"))
+
+# Memory knob for ID path VAE decode
+ID_LATENT_DOWNSCALE = int(os.getenv("ID_LATENT_DOWNSCALE", "1"))
 
 print(f"BATCH_SIZE {BATCH_SIZE}")
 print(f"ACC_STEPS  {ACC_STEPS}")
@@ -133,7 +132,7 @@ print(f"NUM_FRAMES {NUM_FRAMES}  FPS {FPS}  SIZE {TARGET_W}x{TARGET_H}")
 print(f"ID λ {LAMBDA_ID}  MOTION_BUCKET_ID {MOTION_BUCKET_ID}  NOISE_AUG {NOISE_AUG_STRENGTH}")
 print(f"TS window [{TS_MIN},{TS_MAX})")
 print(f"MIXED_PRECISION {MIXED_PRECISION}  USE_EMA {USE_EMA} (decay={EMA_DECAY})")
-
+print(f"ID_LATENT_DOWNSCALE {ID_LATENT_DOWNSCALE}")
 
 # =============================================================================
 # Helpers
@@ -161,14 +160,9 @@ class _LinearProbe(torch.nn.Module):
         return torch.zeros((x.shape[0], self.out_features), device=x.device, dtype=x.dtype)
 
 class ZeroAddEmbedding(torch.nn.Module):
-    """
-    A no-op add_embedding that:
-    - returns zeros with shape [B, time_dim] so it can be added to time_embeds
-    - exposes `.linear_1.in_features` for pipeline introspection (diffusers 0.24.0)
-    """
     def __init__(self, in_features: int, time_out_features: int):
         super().__init__()
-        self.linear_1 = _LinearProbe(in_features, time_out_features)   # exposes `.in_features`
+        self.linear_1 = _LinearProbe(in_features, time_out_features)
         self.linear_2 = _LinearProbe(time_out_features, time_out_features)
     def forward(self, time_embeds: torch.Tensor) -> torch.Tensor:
         return torch.zeros(
@@ -178,13 +172,8 @@ class ZeroAddEmbedding(torch.nn.Module):
         )
 
 def maybe_neutralize_add_embedding(unet, device, mp_dtype) -> bool:
-    """
-    Neutralize add_embedding only if the checkpoint's module expects a different
-    input size than the runtime will feed (time_dim + addition_time_embed_dim).
-    Returns True if patched.
-    """
     try:
-        time_dim = int(unet.time_embedding.linear_2.out_features)   # usually 1280
+        time_dim = int(unet.time_embedding.linear_2.out_features)
         add_dim  = int(getattr(unet.config, "addition_time_embed_dim", 0) or 0)
         lin1 = getattr(getattr(unet, "add_embedding", None), "linear_1", None)
         in_feat = int(lin1.in_features) if lin1 is not None else None
@@ -198,20 +187,17 @@ def maybe_neutralize_add_embedding(unet, device, mp_dtype) -> bool:
         needs_patch = in_feat is not None and in_feat != expected_in
 
         if needs_patch:
-            # Install a safe zero-embed with a believable .linear_1.in_features.
             proj_in = int(getattr(unet.config, "projection_class_embeddings_input_dim", 768))
             print(f"[FIX] add_embedding mismatch: expects {in_feat}, runtime feeds {expected_in}. Neutralizing.")
             print(f"[FIX] Installing ZeroAddEmbedding(in_features={proj_in}, time_dim={time_dim})")
             unet.add_embedding = ZeroAddEmbedding(in_features=proj_in, time_out_features=time_dim).to(
                 device=device, dtype=mp_dtype
             )
-            # Minimize any use of additional embeddings downstream.
             unet.config.addition_time_embed_dim = 0
-            if hasattr(unet, "addition_time_embed_dim"):
-                setattr(unet, "addition_time_embed_dim", 0)
+            # Do not touch unet.addition_time_embed_dim directly (avoids FutureWarning).
             for p in unet.add_embedding.parameters():
                 p.requires_grad = False
-            print("[FIX] add_embedding neutralized; addition_time_embed_dim set to 0.")
+            print("[FIX] add_embedding neutralized; addition_time_embed_dim set to 0 in config.")
             return True
         else:
             print("[OK] add_embedding dimensions are consistent.")
@@ -230,68 +216,101 @@ def load_and_prepare_bgr_image(path: Path) -> Optional[np.ndarray]:
         img = img[:, :, :3]
     return img
 
+# ---------- Robust LoRA injection (no guessed names, no get_attn_processors) ----------
+def _resolve_module(root: nn.Module, dotted: str) -> nn.Module:
+    """
+    Traverse `root` following a dotted path. Supports numeric tokens for ModuleList indices.
+    Example key: 'down_blocks.0.attentions.0.transformer_blocks.0.attn1.processor'
+    We pass everything up to '.processor' into this function.
+    """
+    cur = root
+    for tok in dotted.split("."):
+        if tok == "":
+            continue
+        if tok.isdigit():
+            cur = cur[int(tok)]
+        else:
+            cur = getattr(cur, tok)
+    return cur
+
+def _infer_hidden_and_cross(attn_mod: nn.Module) -> tuple[int, Optional[int]]:
+    """
+    Infer hidden_size and cross_attention_dim from the attention module:
+      hidden_size := attn_mod.to_q.in_features
+      cross_attention_dim := None if to_k.in_features == hidden_size (self-attn)
+                              else to_k.in_features (cross-attn)
+    """
+    to_q = getattr(attn_mod, "to_q", None)
+    to_k = getattr(attn_mod, "to_k", None)
+    if to_q is None or to_k is None or not hasattr(to_q, "in_features") or not hasattr(to_k, "in_features"):
+        raise RuntimeError(f"Cannot infer dims from attention module {type(attn_mod).__name__}")
+    hidden_size = int(to_q.in_features)
+    k_in = int(to_k.in_features)
+    cross_dim = None if k_in == hidden_size else k_in
+    return hidden_size, cross_dim
+
 def inject_lora_safe(unet, r: int, alpha: float):
     """
-    LoRA injection compatible with diffusers 0.24.x: use attn_processors mapping.
+    Robust LoRA injection for UNetSpatioTemporalConditionModel on diffusers 0.24.x.
+    Iterates over `unet.attn_processors`, resolves each owning attention module,
+    infers dims, and replaces the processor with a LoRA processor.
     """
     use_sdpa = hasattr(F, "scaled_dot_product_attention")
     LORA_CLS = LoRAAttnProcessor2_0 if use_sdpa else LoRAAttnProcessor
 
+    base = getattr(unet, "attn_processors", None)
+    if not isinstance(base, dict) or len(base) == 0:
+        print("[LoRA] ERROR: no attention processors mapping found on UNet; cannot inject.")
+        return unet
+
+    new_map = {}
     injected = 0
-    attn_map = getattr(unet, "attn_processors", None)
-    if isinstance(attn_map, dict) and len(attn_map) > 0:
-        attn_procs = {}
-        for name in attn_map.keys():
-            if name.startswith("mid_block"):
-                hidden_size = unet.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name.split(".")[1])
-                hidden_size = unet.config.block_out_channels[ -(block_id + 1) ]
-            elif name.startswith("down_blocks"):
-                block_id = int(name.split(".")[1])
-                hidden_size = unet.config.block_out_channels[ block_id ]
-            else:
-                continue
-            cross_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-            attn_procs[name] = LORA_CLS(
+    for full_name, old_proc in base.items():
+        if not (isinstance(full_name, str) and full_name.endswith(".processor")):
+            # Keep any unexpected entries as-is
+            new_map[full_name] = old_proc
+            continue
+
+        owner_path = full_name[: -len(".processor")]
+        try:
+            attn_mod = _resolve_module(unet, owner_path)
+            hidden_size, cross_dim = _infer_hidden_and_cross(attn_mod)
+            new_map[full_name] = LORA_CLS(
                 hidden_size=hidden_size,
                 cross_attention_dim=cross_dim,
                 rank=r,
                 network_alpha=alpha,
             )
-        if attn_procs:
-            unet.set_attn_processor(attn_procs)
-            injected = len(attn_procs)
+            injected += 1
+        except Exception as e:
+            new_map[full_name] = old_proc
+            print(f"[LoRA] WARN: skipped {full_name}: {e}")
 
-    print(f"[LoRA] Injected LoRA into {injected} attention processors via set_attn_processor().")
+    if injected == 0:
+        print("[LoRA] ERROR: injected 0 processors; training would be a no-op.")
+    else:
+        unet.set_attn_processor(new_map)
+        print(f"[LoRA] Injected LoRA into {injected} attention processors.")
+        sample_keys = [k for k, v in new_map.items() if isinstance(v, (LoRAAttnProcessor, LoRAAttnProcessor2_0))][:6]
+        if sample_keys:
+            print("[LoRA] sample injected keys:", ", ".join(sample_keys))
     return unet
 
 def save_lora_weights(unet, out_path: Path):
-    """
-    Save only LoRA weights by iterating over attention processors mapping.
-    """
     procs = getattr(unet, "attn_processors", None)
     if not isinstance(procs, dict) or len(procs) == 0:
-        try:
-            procs = unet.get_attn_processors()
-        except Exception:
-            procs = {}
-
+        procs = {}
     state = {}
     for name, proc in procs.items():
         if hasattr(proc, "state_dict"):
             sd = proc.state_dict()
             for p_name, p in sd.items():
                 state[f"{name}.{p_name}"] = p.detach().cpu()
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
     st.save_file(state, str(out_path))
     print(f"[LoRA] Saved {len(state)} tensors → {out_path}")
 
 def build_added_time_ids(b: int, latents_hw, fps, motion_bucket_id, noise_aug_strength, dtype, device):
-    """
-    SVD-XT 1.1 requires: [fps, motion_bucket_id, noise_aug_strength, latent_h, latent_w, 0.0]
-    """
     h, w = latents_hw
     vec = torch.tensor(
         [float(fps), float(motion_bucket_id), float(noise_aug_strength), float(h), float(w), 0.0],
@@ -300,23 +319,17 @@ def build_added_time_ids(b: int, latents_hw, fps, motion_bucket_id, noise_aug_st
     return vec.unsqueeze(0).repeat(b, 1)
 
 def fix_group_norm_channels(unet):
-    """
-    Safety: patch first down block’s GroupNorm channels if mismatched.
-    """
     try:
         down_blocks = getattr(unet, "down_blocks", None)
         if not down_blocks:
             print("[GROUPNORM-FIX] Skipped (no down_blocks).")
             return
-
         first = down_blocks[0]
         if not hasattr(first, "resnets"):
             print("[GROUPNORM-FIX] Skipped (first down_block has no resnets).")
             return
-
         device = next(unet.parameters()).device
         patched = 0
-
         for i, resnet in enumerate(first.resnets):
             inner = resnet
             if hasattr(resnet, "spatial_res_block") and hasattr(resnet.spatial_res_block, "conv1"):
@@ -326,7 +339,6 @@ def fix_group_norm_channels(unet):
                 expected = resnet.conv1.out_channels
             else:
                 continue
-
             if hasattr(inner, "norm1") and isinstance(inner.norm1, nn.GroupNorm):
                 old = inner.norm1
                 if old.num_channels != expected:
@@ -342,7 +354,6 @@ def fix_group_norm_channels(unet):
                     inner.norm1 = new.to(device)
                     print(f"[GROUPNORM-FIX] Patched norm1 in down_blocks[0].resnets[{i}] to {expected} ch.")
                     patched += 1
-
             if hasattr(inner, "norm2") and isinstance(inner.norm2, nn.GroupNorm):
                 old2 = inner.norm2
                 if old2.num_channels != expected:
@@ -358,10 +369,8 @@ def fix_group_norm_channels(unet):
                     inner.norm2 = new2.to(device)
                     print(f"[GROUPNORM-FIX] Patched norm2 in down_blocks[0].resnets[{i}] to {expected} ch.")
                     patched += 1
-
         if patched == 0:
             print("[GROUPNORM-FIX] No changes applied (already consistent).")
-
     except Exception as e:
         print(f"[GROUPNORM-FIX] Skipped due to exception: {e}")
 
@@ -369,10 +378,7 @@ def collect_lora_parameters(unet):
     params = []
     procs = getattr(unet, "attn_processors", None)
     if not isinstance(procs, dict) or len(procs) == 0:
-        try:
-            procs = unet.get_attn_processors()
-        except Exception:
-            procs = {}
+        return params
     for proc in procs.values():
         if isinstance(proc, (LoRAAttnProcessor, LoRAAttnProcessor2_0)):
             params += list(proc.parameters())
@@ -422,7 +428,7 @@ def main():
 
     bkt = gcs_bucket(BUCKET)
 
-    # 1) Dataset (combine body + face crops → ~280 images)
+    # 1) Dataset
     face_paths = ensure_local_dataset(bkt, f"ai_avatars/{AI_AVATAR_ID}/face_crops", LOCAL_DATA / "faces", (".png", ".jpg", ".jpeg"))
     body_paths = ensure_local_dataset(bkt, f"ai_avatars/{AI_AVATAR_ID}/body_crops", LOCAL_DATA / "bodies", (".png", ".jpg", ".jpeg"))
 
@@ -476,26 +482,26 @@ def main():
     # Move submodules
     pipe.vae = pipe.vae.to(device, dtype=mp_dtype)
 
-    # 4) ArcFace anchor
+    # 4) ArcFace anchor (Torch path)
     arc = ArcFaceID()
     anchor_emb = torch.zeros(512, dtype=torch.float32, device=device)
     if arc.is_ready:
         anchor_img = load_and_prepare_bgr_image(LOCAL_DATA / "faces" / "identity.png")
         if anchor_img is not None:
-            with torch.inference_mode():
-                emb_tmp = arc.embed_bgr(anchor_img)
-            if emb_tmp is not None:
-                emb_tmp = emb_tmp.to(device)
-                anchor_emb = emb_tmp / (emb_tmp.norm(p=2) + 1e-8)
-            else:
-                print("WARNING: ArcFace could not detect a face in identity.png.")
+            anc_rgb = cv2.cvtColor(anchor_img, cv2.COLOR_BGR2RGB)
+            anc_rgb = torch.from_numpy(anc_rgb).permute(2, 0, 1).float() / 255.0  # [3,H,W]
+            anc_rgb = anc_rgb.unsqueeze(0).to(device)                              # [1,3,H,W]
+            with torch.no_grad():
+                anchor_emb = arc.embed_torch(anc_rgb, do_crop=True)[0]  # L2-normalized [512]
         else:
             print("WARNING: identity.png not found or empty.")
+    else:
+        print("WARNING: ArcFace torch embedder not available; identity loss will be disabled.")
 
     # 5) Patch add_embedding *after* accelerator/dtype are known
     maybe_neutralize_add_embedding(pipe.unet, device, mp_dtype)
 
-    # Sanity: print UNet embedding config
+    # Sanity prints
     u = pipe.unet
     try:
         print("[CHK] add_embedding is callable:", callable(getattr(u, "add_embedding", None)))
@@ -508,6 +514,12 @@ def main():
     # 6) LoRA + GN fix
     inject_lora_safe(pipe.unet, r=LORA_RANK, alpha=LORA_ALPHA)
     fix_group_norm_channels(pipe.unet)
+
+    # Sanity check: ensure we actually injected LoRA
+    procs_after = getattr(pipe.unet, "attn_processors", {}) or {}
+    n_lora = sum(isinstance(p, (LoRAAttnProcessor, LoRAAttnProcessor2_0)) for p in procs_after.values())
+    print(f"[LoRA] processors total={len(procs_after)}  lora_processors={n_lora}")
+    assert len(procs_after) > 0 and n_lora > 0, "LoRA injection failed (0 LoRA processors)."
 
     # 7) Trainables, optimizer, scheduler
     trainable_params = collect_lora_parameters(pipe.unet)
@@ -522,10 +534,10 @@ def main():
     pipe.unet = pipe.unet.to(device)
     pipe.unet.train()
 
-    # 8) EMA (after prepare so params are final objects on the right device)
+    # 8) EMA
     ema_shadow = build_ema(trainable_params, device=device) if USE_EMA else None
 
-    # Cross-attn context: zeros (SVD img->vid expects context tensor of size cross_attention_dim)
+    # Cross-attn context (zeros)
     cross_dim = int(getattr(pipe.unet.config, "cross_attention_dim", 0))
     if cross_dim <= 0:
         raise RuntimeError(f"Invalid cross_attention_dim={cross_dim} (must be > 0 for SVD).")
@@ -611,7 +623,7 @@ def main():
                     )
                     _dprint(f"[DBG] added_time_ids: shape={tuple(added_time_ids.shape)}, sample[0]={added_time_ids[0].tolist()}")
 
-                    # -------------------- UNet forward (diffusers 0.24.x) --------------------
+                    # -------------------- UNet forward --------------------
                     with torch.autocast(device_type=device.type, dtype=mp_dtype, enabled=(accelerator.mixed_precision != "no")):
                         out = pipe.unet(
                             noisy_latents,                 # [B,F,8,H/8,W/8]
@@ -639,33 +651,63 @@ def main():
                 model_pred_noise = model_pred[:, :4]    # predicted noise
                 loss_recon = F.mse_loss(model_pred_noise.float(), noise.float())
 
-                # Identity loss (random subset of frames)
+                # Identity loss — DIFFERENTIABLE with Euler sigmas
                 total_id_loss = torch.tensor(0.0, device=device)
+                faces_used = 0
+
                 if arc.is_ready and LAMBDA_ID > 0:
-                    # (slow) Turn on if you want identity guidance during training
-                    # print('Processing ArcFace on random frames')
-                    with torch.no_grad():
-                        for i in range(b):
-                            frame_indices = random.sample(range(NUM_FRAMES), ARC_FACE_NUM_FRAMES)
-                            for j in frame_indices:
-                                idx = i * NUM_FRAMES + j
-                                target_latent_ij = target_latents[idx].unsqueeze(0)
-                                model_pred_ij = model_pred_noise[idx].unsqueeze(0)
+                    sel_indices = []
+                    for i in range(b):
+                        js = random.sample(range(NUM_FRAMES), min(ARC_FACE_NUM_FRAMES, NUM_FRAMES))
+                        sel_indices.extend([i * NUM_FRAMES + j for j in js])
 
-                                rec_latent = target_latent_ij - model_pred_ij
-                                rec = pipe.vae.decode(rec_latent / pipe.vae.config.scaling_factor, num_frames=1).sample
-                                rec_img = (rec.clamp(-1, 1) * 0.5 + 0.5)
+                    if len(sel_indices) > 0:
+                        noisy4_sel = noisy_latents_flat[sel_indices, :4]     # [K,4,h,w]
+                        pred4_sel  = model_pred_noise[sel_indices]           # [K,4,h,w]
+                        t_sel      = t_per_frame[sel_indices]                # [K]
 
-                                rec_rgb = (rec_img * 255).to(torch.uint8).permute(0, 2, 3, 1)
-                                rec_bgr = rec_rgb[0].cpu().numpy()[:, :, ::-1]
+                        timesteps = pipe.scheduler.timesteps.to(noisy4_sel.device)   # [N]
+                        sigmas    = pipe.scheduler.sigmas.to(noisy4_sel.device)      # [N]
 
-                                emb = arc.embed_bgr(rec_bgr)
-                                if emb is not None:
-                                    emb = emb.to(device); emb = emb / (emb.norm(p=2) + 1e-8)
-                                    id_sim = cosine_sim(emb, anchor_emb)
-                                    total_id_loss += (1.0 - id_sim)
+                        if t_sel.ndim == 0:
+                            t_sel = t_sel.view(1)
+                        match = (t_sel.view(-1, 1) == timesteps.view(1, -1))         # [K,N]
+                        has_match = match.any(dim=1)
+                        idx_exact = match.float().argmax(dim=1)
+                        nearest = (timesteps.float().view(1, -1) - t_sel.float().view(-1, 1)).abs().argmin(dim=1)
+                        idx = torch.where(has_match, idx_exact, nearest)             # [K]
+                        sigma_t = sigmas[idx].view(-1, 1, 1, 1)                      # [K,1,1,1]
 
-                    id_loss_avg = (total_id_loss / max(b * ARC_FACE_NUM_FRAMES, 1)) * LAMBDA_ID
+                        x0_latent = noisy4_sel - sigma_t * pred4_sel                 # [K,4,h,w]
+
+                        # ---- VAE decode for ID path (memory-safe) ----
+                        vae_dtype = next(pipe.vae.parameters()).dtype
+                        latents_dec = (x0_latent / pipe.vae.config.scaling_factor).to(dtype=vae_dtype, device=device)
+
+                        if ID_LATENT_DOWNSCALE > 1:
+                            scale = 1.0 / float(ID_LATENT_DOWNSCALE)
+                            latents_dec = F.interpolate(latents_dec, scale_factor=scale, mode="bilinear", align_corners=False)
+
+                        def _vae_decode(inp):
+                            # No image_only_indicator kwarg for this diffusers version
+                            return pipe.vae.decode(inp, num_frames=1).sample
+
+                        with torch.autocast(device_type=device.type, dtype=mp_dtype, enabled=(accelerator.mixed_precision != "no")):
+                            rec = ckpt(_vae_decode, latents_dec, use_reentrant=False)
+
+                        rec_img01 = (rec.clamp(-1, 1) * 0.5 + 0.5).to(torch.float32)  # [K,3,H,W] fp32 for embedder
+
+                        # Run Torch face embedder (returns L2-normalized embeddings)
+                        with torch.autocast(device_type=device.type, enabled=False):
+                            emb_k = arc.embed_torch(rec_img01, do_crop=True)         # [K,512], normalized
+                            id_sim = F.cosine_similarity(
+                                emb_k, anchor_emb.unsqueeze(0).expand_as(emb_k), dim=1
+                            )  # [K]
+                            total_id_loss = (1.0 - id_sim).mean()
+
+                        faces_used = int(emb_k.shape[0])
+
+                    id_loss_avg = total_id_loss * LAMBDA_ID
                 else:
                     id_loss_avg = torch.tensor(0.0, device=device)
 
@@ -673,55 +715,44 @@ def main():
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    # --- grad norms (before and after clipping) ---
                     grad_before = _grad_global_norm(trainable_params)
-                    accelerator.clip_grad_norm_(trainable_params, 1.0)  # in-place
+                    accelerator.clip_grad_norm_(trainable_params, 1.0)
                     grad_after = _grad_global_norm(trainable_params)
 
-                    # -- optimizer step --
                     opt.step()
-                    lr_sched.step()  # step AFTER optimizer step
+                    lr_sched.step()
 
-                    # -- EMA of updated weights --
                     if USE_EMA and ema_shadow is not None:
                         with torch.no_grad():
                             ema_update(ema_shadow, trainable_params, EMA_DECAY)
 
-                    # -- count an optimizer step --
                     global_step += 1
 
-                    # --- Logging (only on real steps to avoid micro-step noise) ---
                     if accelerator.is_main_process:
                         with torch.no_grad():
                             lr_val  = opt.param_groups[0]["lr"]
                             temp_mid = float(t_seq.mean().item()) if isinstance(t_seq, torch.Tensor) else 0.0
-                            id_w    = float(id_loss_avg.item()) if torch.is_tensor(id_loss_avg) else 0.0
-                            id_raw  = float(total_id_loss.item()) if torch.is_tensor(total_id_loss) else 0.0
-
                             print(
                                 f"[STEP] e={epoch+1} s={global_step} lr={lr_val:.2e} "
-                                f"recon={float(loss_recon.item()):.6f} id={id_raw:.6f} "
-                                f"id_w={id_w:.3f} temp={temp_mid:.6f} total={float(loss.item()):.6f} "
-                                f"grad_raw={grad_before:.3f} grad={grad_after:.3f} mem={_mem_str()}"
+                                f"recon={float(loss_recon.item()):.6f} id={float(total_id_loss):.6f} "
+                                f"id_w={float(id_loss_avg):.3f} temp={temp_mid:.6f} total={float(loss.item()):.6f} "
+                                f"grad_raw={grad_before:.3f} grad={grad_after:.3f} mem={_mem_str()} id_frames={faces_used}"
                             )
 
-                    # zero *after* logging so grads were still available for norms
                     opt.zero_grad()
 
-                    # -- early stop based on optimizer steps --
                     if MAX_STEPS > 0 and global_step >= MAX_STEPS:
                         break
                 else:
-                    # (optional) micro-step debug prints go here if you really want them
                     pass
 
         # 9) Save checkpoint per epoch (both regular + EMA)
         if accelerator.is_main_process:
             unet_unwrapped = accelerator.unwrap_model(pipe.unet)
 
-            ckpt = LOCAL_OUT / f"{TARGET_MODEL_NAME}_epoch{epoch+1}.safetensors"
-            save_lora_weights(unet_unwrapped, ckpt)
-            upload_file(bkt, f"{OUT_PREFIX}/{ckpt.name}", ckpt, content_type="application/octet-stream")
+            ckpt_path = LOCAL_OUT / f"{TARGET_MODEL_NAME}_epoch{epoch+1}.safetensors"
+            save_lora_weights(unet_unwrapped, ckpt_path)
+            upload_file(bkt, f"{OUT_PREFIX}/{ckpt_path.name}", ckpt_path, content_type="application/octet-stream")
 
             if USE_EMA and ema_shadow is not None:
                 backup = swap_in_ema(trainable_params, ema_shadow)

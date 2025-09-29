@@ -40,7 +40,8 @@ RUN pip install --no-cache-dir --upgrade \
     accelerate==0.27.2 \
     huggingface_hub==0.20.3 \
     bitsandbytes \
-    xformers
+    xformers \
+    facenet-pytorch
 
 # Cache site-packages to copy into runtime
 RUN mkdir -p /install && cp -r /usr/local/lib/python3.10/dist-packages /install/dist-packages
@@ -76,7 +77,7 @@ ENV HF_HOME=/root/.cache/huggingface
 ENV TORCH_HOME=/root/.cache/torch
 ENV HF_HUB_DISABLE_TELEMETRY=1
 ENV INSIGHTFACE_ONNX_PROVIDERS="CUDAExecutionProvider,CPUExecutionProvider"
-# Optional: mitigate CUDA memory fragmentation (safe to leave commented)
-ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9
+# Optional: mitigate CUDA memory fragmentation
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.7
 
 ENTRYPOINT ["python", "-m", "avatar_training_job.main"]

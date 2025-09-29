@@ -34,17 +34,17 @@ from lora_sample.gcs_utils import (
 # =============================================================================
 BUCKET = os.getenv("JOBS_BUCKET", "your-gcs-bucket-name")
 AI_AVATAR_ID = os.getenv("AI_AVATAR_ID", "default-avatar-id")
-TARGET_MODEL_NAME = os.getenv("TARGET_MODEL_NAME", "default-lora-model")
+TARGET_MODEL_FOLDER = os.getenv("TARGET_MODEL_FOLDER", "white-shirt")
+TARGET_MODEL_PATH = os.getenv("TARGET_MODEL_PATH", f"ai_avatars/{AI_AVATAR_ID}/models/{TARGET_MODEL_FOLDER}/model_name.safetensors")
 
 # GCS paths for assets
 BASE_MODEL_PREFIX = "models/mimic_motion/stable-video-diffusion-img2vid-xt-1-1"
-LORA_MODEL_PATH_REMOTE = f"ai_avatars/{AI_AVATAR_ID}/models/{TARGET_MODEL_NAME}/{TARGET_MODEL_NAME}.safetensors"
 CONDITIONING_IMAGE_PATH_REMOTE = f"ai_avatars/{AI_AVATAR_ID}/body_crops/identity.png"
-VIDEO_OUT_PREFIX = f"ai_avatars/{AI_AVATAR_ID}/models/{TARGET_MODEL_NAME}"
+VIDEO_OUT_PREFIX = f"ai_avatars/{AI_AVATAR_ID}/models/{TARGET_MODEL_FOLDER}"
 
 # Local paths
 LOCAL_BASE_MODEL = Path("/models/svd_1_1")
-LOCAL_LORA_MODEL = Path(f"/models/lora/{TARGET_MODEL_NAME}.safetensors")
+LOCAL_LORA_MODEL = Path(f"/models/lora/lora.safetensors")
 LOCAL_CONDITIONING_IMAGE = Path("/data/identity.png")
 LOCAL_OUT = Path("/output")
 for d in (LOCAL_BASE_MODEL, LOCAL_LORA_MODEL.parent, LOCAL_CONDITIONING_IMAGE.parent, LOCAL_OUT):
@@ -172,7 +172,7 @@ def main():
     # 3) Download assets
     print("Downloading assets from GCS...")
     download_folder(bkt, BASE_MODEL_PREFIX, LOCAL_BASE_MODEL)
-    download_file(bkt, LORA_MODEL_PATH_REMOTE, LOCAL_LORA_MODEL)
+    download_file(bkt, TARGET_MODEL_PATH, LOCAL_LORA_MODEL)
     download_file(bkt, CONDITIONING_IMAGE_PATH_REMOTE, LOCAL_CONDITIONING_IMAGE)
     print("Downloads complete.")
 
@@ -263,7 +263,7 @@ def main():
     print(f"Generated {len(frames)} frames ({TARGET_WIDTH}x{TARGET_HEIGHT}).")
 
     # 10) Save MP4
-    video_out_path = LOCAL_OUT / f"{TARGET_MODEL_NAME}_sample.mp4"
+    video_out_path = LOCAL_OUT / f"lora_sample.mp4"
     print(f"Saving video to {video_out_path}...")
     frames_np = [np.array(f) if not isinstance(f, np.ndarray) else f for f in frames]
     iio.imwrite(
