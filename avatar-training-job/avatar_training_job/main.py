@@ -119,7 +119,7 @@ USE_EMA   = os.getenv("USE_EMA", "1") == "1"
 EMA_DECAY = float(os.getenv("EMA_DECAY", "0.9995"))
 
 # Memory knob for ID path VAE decode
-ID_LATENT_DOWNSCALE = int(os.getenv("ID_LATENT_DOWNSCALE", "1"))
+ID_LATENT_DOWNSCALE = int(os.getenv("ID_LATENT_DOWNSCALE", "2"))
 
 print(f"BATCH_SIZE {BATCH_SIZE}")
 print(f"ACC_STEPS  {ACC_STEPS}")
