@@ -47,6 +47,22 @@ gcloud ai custom-jobs create \
             {
               "name": "ID_LATENT_DOWNSCALE",
               "value": "2"
+            },
+                        {
+              "name": "ACC_STEPS",
+              "value": "8"
+            },
+                        {
+              "name": "LR",
+              "value": "3e-5"
+            },
+                        {
+              "name": "WD",
+              "value": "0.01"
+            },
+                        {
+              "name": "LORA_ALPHA",
+              "value": "32.0"
             }
           ]
         }

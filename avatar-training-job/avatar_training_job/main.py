@@ -779,45 +779,6 @@ def main():
             upload_file(bkt, f"{OUT_PREFIX}/{final_ema.name}", final_ema, content_type="application/octet-stream")
             restore_from_backup(trainable_params, backup)
 
-        # --- quick smoke test video ---
-        test_cond = load_and_prepare_bgr_image(LOCAL_DATA / "bodies" / "identity.png")
-        if test_cond is None:
-            print("WARNING: Skipping test generation due to missing/empty identity.png.")
-        else:
-            test_rgb = cv2.cvtColor(test_cond, cv2.COLOR_BGR2RGB)
-            test_image_pil = Image.fromarray(test_rgb)
-
-            pipe.to(accelerator.device)
-            infer_dtype = next(pipe.unet.parameters()).dtype
-            pipe.to(torch_dtype=infer_dtype)
-            if getattr(pipe, "image_encoder", None) is not None:
-                pipe.image_encoder.to(accelerator.device, dtype=infer_dtype).eval()
-            if getattr(pipe, "vae", None) is not None:
-                pipe.vae.to(accelerator.device, dtype=infer_dtype).eval()
-            pipe.unet.eval()
-
-            use_amp = (accelerator.device.type == "cuda" and infer_dtype in (torch.float16, torch.bfloat16))
-            amp = torch.autocast("cuda", dtype=infer_dtype) if use_amp else nullcontext()
-
-            gen = torch.Generator(device="cpu").manual_seed(42)
-
-            with torch.inference_mode(), amp:
-                result = pipe(
-                    image=test_image_pil,
-                    num_frames=NUM_FRAMES,
-                    decode_chunk_size=4,
-                    fps=FPS,
-                    height=TARGET_H,
-                    width=TARGET_W,
-                    generator=gen,
-                )
-                frames = result.frames[0]
-
-            test_video = LOCAL_OUT / f"{TARGET_MODEL_NAME}.mp4"
-            frames_np = [np.array(f) for f in frames]
-            iio.imwrite(test_video, frames_np, fps=FPS, codec="h264", quality=8)
-            upload_file(bkt, f"{OUT_PREFIX}/{test_video.name}", test_video, content_type="video/mp4")
-
         print(f"[DONE] Training finished. Final files uploaded to gs://{BUCKET}/{OUT_PREFIX}")
 
 
