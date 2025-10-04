@@ -50,30 +50,30 @@ class TrainConfig:
     crop_h: int = int(os.getenv("CROP_H", "1024"))
     crop_w: int = int(os.getenv("CROP_W", "576"))
 
-    epochs: int = int(os.getenv("EPOCHS", "20"))
+    epochs: int = int(os.getenv("EPOCHS", "18"))
     batch_size: int = int(os.getenv("BATCH_SIZE", "1"))
-    num_workers: int = int(os.getenv("NUM_WORKERS", "2"))
+    num_workers: int = int(os.getenv("NUM_WORKERS", "4"))
 
-    lr: float = float(os.getenv("LR", "5e-5"))
-    weight_decay: float = float(os.getenv("WEIGHT_DECAY", "0.0"))
-    grad_accum: int = int(os.getenv("GRAD_ACCUM", "1"))
+    lr: float = float(os.getenv("LR", "4e-5"))
+    weight_decay: float = float(os.getenv("WEIGHT_DECAY", "1e-2"))
+    grad_accum: int = int(os.getenv("GRAD_ACCUM", "8"))
     mixed_precision: str = os.getenv("MIXED_PRECISION", "bf16")
     seed: int = int(os.getenv("SEED", "42"))
     max_train_steps: Optional[int] = int(os.getenv("MAX_TRAIN_STEPS", "0")) or None
-    save_every_n_steps: int = int(os.getenv("SAVE_EVERY_N_STEPS", "200"))
+    save_every_n_steps: int = int(os.getenv("SAVE_EVERY_N_STEPS", "500"))
 
-    lora_rank: int = int(os.getenv("LORA_RANK", "32"))
-    lora_alpha: float = float(os.getenv("LORA_ALPHA", "32"))
+    lora_rank: int = int(os.getenv("LORA_RANK", "64"))
+    lora_alpha: float = float(os.getenv("LORA_ALPHA", "64"))
     lora_scale: float = float(os.getenv("LORA_SCALE", "1.0"))
     lora_dropout: float = float(os.getenv("LORA_DROPOUT", "0.05"))
 
-    id_clip_weight: float = float(os.getenv("ID_CLIP_WEIGHT", "0.2"))
-    mse_face_weight: float = float(os.getenv("MSE_FACE_WEIGHT", "3.0"))
+    id_clip_weight: float = float(os.getenv("ID_CLIP_WEIGHT", "0.4"))
+    mse_face_weight: float = float(os.getenv("MSE_FACE_WEIGHT", "2.5"))
 
-    face_det_min_size: int = int(os.getenv("FACE_DET_MIN_SIZE", "80"))
+    face_det_min_size: int = int(os.getenv("FACE_DET_MIN_SIZE", "96"))
     fps: int = int(os.getenv("SVD_FPS", "6"))
     motion_bucket_id: int = int(os.getenv("SVD_MOTION_BUCKET_ID", "127"))
-    noise_aug_strength: float = float(os.getenv("SVD_NOISE_AUG", "0.0"))
+    noise_aug_strength: float = float(os.getenv("SVD_NOISE_AUG", "0.02"))
 
     pose_sigma: float = float(os.getenv("POSE_SIGMA", "6.0"))
     body_crops_prefix: str = "body_crops"

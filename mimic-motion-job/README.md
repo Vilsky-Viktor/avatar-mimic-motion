@@ -41,17 +41,9 @@ gcloud ai custom-jobs create \
               "value": "jobs/fbe5afcb-4666-4933-b472-269ae858a597/video1.mp4"
             },
             {
-              "name": "LORA_RANK",
-              "value": "64"
-            },
-            {
               "name": "LORA_SCALE",
               "value": "1.0"
             },
-            {
-              "name": "GUIDANCE_SCALE",
-              "value": "2.5"
-            }
           ],
         }
       }
