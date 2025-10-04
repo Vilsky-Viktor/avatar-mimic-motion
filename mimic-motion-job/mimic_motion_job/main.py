@@ -14,8 +14,8 @@ JOBS_BUCKET = os.environ["JOBS_BUCKET"]
 EXECUTION_ID = os.environ["EXECUTION_ID"]
 REF_IMAGE_PATH = os.environ["REF_IMAGE_PATH"]
 REF_VIDEO_PATH = os.environ["REF_VIDEO_PATH"]
-LORA_ALPHA = int(os.getenv("LORA_ALPHA", "64"))
-LORA_SCALE = float(os.getenv("LORA_SCALE", "1.8"))
+LORA_ALPHA = int(os.getenv("LORA_ALPHA", "32"))
+LORA_SCALE = float(os.getenv("LORA_SCALE", "1.0"))
 
 NUM_FRAMES = int(os.getenv("NUM_FRAMES", "72"))
 RESOLUTION = int(os.getenv("RESOLUTION", "576"))

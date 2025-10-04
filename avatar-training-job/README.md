@@ -35,6 +35,10 @@ gcloud ai custom-jobs create \
             {
               "name": "AI_AVATAR_ID",
               "value": "ver1"
+            },
+            {
+              "name": "ID_CLIP_WEIGHT",
+              "value": "0.2"
             }
           ]
         }
