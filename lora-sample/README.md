@@ -29,8 +29,12 @@ gcloud ai custom-jobs create \
               "value": "ver1"
             },
             {
-              "name": "TARGET_MODEL_NAME",
+              "name": "TARGET_MODEL_FOLDER",
               "value": "white-socks"
+            },
+            {
+              "name": "TARGET_MODEL_PATH",
+              "value": "ai_avatars/ver1/models/white-socks/white-socks.ema.safetensors"
             }
           ]
         }

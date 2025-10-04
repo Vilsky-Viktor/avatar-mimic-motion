@@ -1,13 +1,13 @@
 # Build image
 ```
-gcloud builds submit --tag asia.gcr.io/billion-ai-girls/avatar-training-job
+gcloud builds submit --tag asia.gcr.io/billion-ai-girls/upscaling-job
 ```
 
 # Run job
 ```
 gcloud ai custom-jobs create \
   --region=asia-southeast1 \
-  --display-name=avatar-training-job \
+  --display-name=upscaling-job \
   --config=<(echo '{
     "workerPoolSpecs": [
       {
@@ -17,25 +17,21 @@ gcloud ai custom-jobs create \
           "acceleratorCount": 1
         },
         "replicaCount": 1,
-        "diskSpec": {
-          "bootDiskType": "pd-ssd",
-          "bootDiskSizeGb": 200
-        },
         "containerSpec": {
-          "imageUri": "asia.gcr.io/billion-ai-girls/avatar-training-job:latest",
+          "imageUri": "asia.gcr.io/billion-ai-girls/upscaling-job:latest",
           "env": [
             {
               "name": "JOBS_BUCKET",
               "value": "billion-ai-girls-asia"
             },
             {
-              "name": "EXECUTION_ID",
-              "value": "9d891abe-3f41-412b-b72c-98d12995fe18"
+              "name": "INPUT_URI",
+              "value": "gs://billion-ai-girls-asia/jobs/fbe5afcb-4666-4933-b472-269ae858a597/generated.mp4"
             },
             {
-              "name": "AI_AVATAR_ID",
-              "value": "ver1"
-            }
+              "name": "ESRGAN_WEIGHTS_URI",
+              "value": "gs://billion-ai-girls-asia/models/real-esrgan/RealESRGAN_x2plus.pth"
+            },
           ]
         }
       }

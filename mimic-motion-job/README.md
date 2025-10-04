@@ -1,12 +1,12 @@
 # Build image
 ```
-gcloud builds submit --tag gcr.io/billion-ai-girls/mimic-motion-job
+gcloud builds submit --tag asia.gcr.io/billion-ai-girls/mimic-motion-job
 ```
 
 # Run job
 ```
 gcloud ai custom-jobs create \
-  --region=us-central1 \
+  --region=asia-southeast1 \
   --display-name=mimic-motion-job \
   --config=<(echo '{
     "workerPoolSpecs": [
@@ -22,25 +22,37 @@ gcloud ai custom-jobs create \
           "bootDiskSizeGb": 200
         },
         "containerSpec": {
-          "imageUri": "gcr.io/billion-ai-girls/mimic-motion-job:latest",
+          "imageUri": "asia.gcr.io/billion-ai-girls/mimic-motion-job:latest",
           "env": [
             {
               "name": "JOBS_BUCKET",
-              "value": "billion-ai-girls-jobs"
+              "value": "billion-ai-girls-asia"
             },
             {
               "name": "EXECUTION_ID",
-              "value": "9d891abe-3f41-412b-b72c-98d12995fe18"
+              "value": "fbe5afcb-4666-4933-b472-269ae858a597"
             },
             {
               "name": "REF_IMAGE_PATH",
-              "value": "jobs/9d891abe-3f41-412b-b72c-98d12995fe18/image2.png"
+              "value": "jobs/fbe5afcb-4666-4933-b472-269ae858a597/image1-1.png"
             },
             {
               "name": "REF_VIDEO_PATH",
-              "value": "jobs/9d891abe-3f41-412b-b72c-98d12995fe18/video2.mp4"
+              "value": "jobs/fbe5afcb-4666-4933-b472-269ae858a597/video1.mp4"
+            },
+            {
+              "name": "LORA_RANK",
+              "value": "64"
+            },
+            {
+              "name": "LORA_SCALE",
+              "value": "1.0"
+            },
+            {
+              "name": "GUIDANCE_SCALE",
+              "value": "2.5"
             }
-          ]
+          ],
         }
       }
     ]

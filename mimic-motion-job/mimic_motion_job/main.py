@@ -14,6 +14,18 @@ JOBS_BUCKET = os.environ["JOBS_BUCKET"]
 EXECUTION_ID = os.environ["EXECUTION_ID"]
 REF_IMAGE_PATH = os.environ["REF_IMAGE_PATH"]
 REF_VIDEO_PATH = os.environ["REF_VIDEO_PATH"]
+LORA_ALPHA = int(os.getenv("LORA_ALPHA", "64"))
+LORA_SCALE = float(os.getenv("LORA_SCALE", "1.8"))
+
+NUM_FRAMES = int(os.getenv("NUM_FRAMES", "72"))
+RESOLUTION = int(os.getenv("RESOLUTION", "576"))
+FRAMES_OVERLAP = int(os.getenv("FRAMES_OVERLAP", "6"))
+NUM_INFERENCE_STEPS = int(os.getenv("NUM_INFERENCE_STEPS", "25"))
+NOISE_AUG_STRENGTH = int(os.getenv("NOISE_AUG_STRENGTH", "0"))
+GUIDANCE_SCALE = float(os.getenv("GUIDANCE_SCALE", "2.0"))
+SAMPLE_STRIDE = int(os.getenv("SAMPLE_STRIDE", "2"))
+FPS = int(os.getenv("FPS", "15"))
+SEED = int(os.getenv("SEED", "42"))
 
 REPO = Path("/app/MimicMotion")
 BASE_CONFIG = REPO / "configs" / "test.yaml"
@@ -43,20 +55,23 @@ def main():
 
     config = {
         "base_model_path": "/app/models/stable-video-diffusion-img2vid-xt-1-1",
+        "lora_path": "/app/MimicMotion/models/lora.safetensors",
+        "lora_alpha": LORA_ALPHA,
+        "lora_scale": LORA_SCALE,
         "ckpt_path": "models/MimicMotion_1-1.pth",
         "test_case": [
             {
                 "ref_video_path": str(ref_vid),
                 "ref_image_path": str(ref_img),
-                "num_frames": 72,
-                "resolution": 576,
-                "frames_overlap": 6,
-                "num_inference_steps": 25,
-                "noise_aug_strength": 0,
-                "guidance_scale": 2.0,
-                "sample_stride": 2,
-                "fps": 15,
-                "seed": 42
+                "num_frames": NUM_FRAMES,
+                "resolution": RESOLUTION,
+                "frames_overlap": FRAMES_OVERLAP,
+                "num_inference_steps": NUM_INFERENCE_STEPS,
+                "noise_aug_strength": NOISE_AUG_STRENGTH,
+                "guidance_scale": GUIDANCE_SCALE,
+                "sample_stride": SAMPLE_STRIDE,
+                "fps": FPS,
+                "seed": SEED
             }
         ]
     }
@@ -72,6 +87,8 @@ def main():
     download_blob(JOBS_BUCKET, "models/mimic_motion/dw-ll_ucoco_384.onnx", MODELS_PATH / "DWPose" / "dw-ll_ucoco_384.onnx")
     download_blob(JOBS_BUCKET, "models/mimic_motion/yolox_l.onnx", MODELS_PATH / "DWPose" / "yolox_l.onnx")
     download_folder(JOBS_BUCKET, "models/mimic_motion/stable-video-diffusion-img2vid-xt-1-1/", "/app/models/stable-video-diffusion-img2vid-xt-1-1")
+
+    download_blob(JOBS_BUCKET, "ai_avatars/ver1/models/lora_mimicmotion_unet/final.safetensors", MODELS_PATH / "lora.safetensors")
 
     # Run inference exactly like README:
     #   python inference.py --inference_config configs/test.yaml

@@ -1,83 +1,55 @@
-# ===============================
-# Stage 1: Build dependencies
-# ===============================
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/root/.cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface/hub \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    CUDA_HOME=/usr/local/cuda \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
 WORKDIR /app
 
+# System deps + NVRTC (needed by cuDNN/PyTorch dyn kernels)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl unzip wget ca-certificates \
-    build-essential cmake pkg-config binutils \
-    python3.10 python3.10-venv python3.10-dev python3-pip && \
-    rm -rf /var/lib/apt/lists/*
+    git ffmpeg curl ca-certificates \
+    python3.11 python3.11-distutils python3.11-dev \
+    build-essential libgl1 libglib2.0-0 libegl1 libgles2 \
+    libjpeg-dev libpng-dev \
+    cuda-nvrtc-11-8 cuda-nvrtc-dev-11-8 \
+ && rm -rf /var/lib/apt/lists/*
 
-RUN ln -sf /usr/bin/python3.10 /usr/bin/python && ln -sf /usr/bin/pip3 /usr/bin/pip
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+# Python 3.11
+RUN ln -s /usr/bin/python3.11 /usr/bin/python
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+RUN python3.11 -m pip install --upgrade pip setuptools wheel
 
-# ✅ PyTorch/cu118 trio that matches:
-# torch 2.0.1  +  torchvision 0.15.2  +  torchaudio 2.0.2
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu118 \
-    torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2
+# PyTorch cu118 (same major as your working job)
+RUN python3.11 -m pip install \
+  --extra-index-url https://download.pytorch.org/whl/cu118 \
+  torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118
 
-# Core runtime deps
-RUN pip install --no-cache-dir --upgrade \
-    google-cloud-storage==3.3.1 \
-    numpy==1.26.4 \
-    opencv-python-headless==4.10.0.84 \
-    Pillow==10.4.0 \
-    tqdm==4.66.4 \
-    pyyaml==6.0.1 \
-    imageio==2.34.1 \
-    imageio-ffmpeg==0.5.1 \
-    safetensors==0.4.5 \
-    einops==0.8.0 \
-    insightface==0.7.3 \
-    onnxruntime-gpu==1.16.3 \
-    requests==2.32.3 \
-    diffusers==0.24.0 \
-    transformers==4.32.1 \
-    accelerate==0.27.2 \
-    huggingface_hub==0.20.3 \
-    bitsandbytes \
-    xformers \
-    facenet-pytorch
+# Core libs (keep your diffs pins; ORT GPU 1.17.1 as in your working job)
+RUN python3.11 -m pip install \
+  diffusers==0.27.0 \
+  transformers==4.43.3 \
+  accelerate==0.30.1 \
+  huggingface-hub==0.23.5 \
+  safetensors==0.4.4 \
+  einops omegaconf \
+  google-cloud-storage==2.18.0 \
+  opencv-python-headless==4.10.0.84 \
+  pillow==10.4.0 \
+  imageio==2.34.1 \
+  tqdm==4.66.4 \
+  numpy==1.26.4 \
+  insightface==0.7.3 \
+  onnxruntime-gpu==1.17.1
 
-# Cache site-packages to copy into runtime
-RUN mkdir -p /install && cp -r /usr/local/lib/python3.10/dist-packages /install/dist-packages
+# MimicMotion source (import path for UNet)
+RUN git clone --depth=1 https://github.com/Tencent/MimicMotion.git /opt/MimicMotion
+ENV PYTHONPATH=/app:/opt/MimicMotion:$PYTHONPATH
 
-# ===============================
-# Stage 2: Runtime image
-# ===============================
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3-pip libgl1 libglib2.0-0 ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN ln -sf /usr/bin/python3.10 /usr/bin/python && ln -sf /usr/bin/pip3 /usr/bin/pip
-
-# CUDA toolchain visibility (NVRTC, cuDNN, etc.)
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
-ENV PATH=/usr/local/cuda/bin:${PATH}
-
-# Copy Python packages from builder stage
-COPY --from=builder /install/dist-packages /usr/local/lib/python3.10/dist-packages
-
-# Project code
+# Your trainer code
 COPY avatar_training_job /app/avatar_training_job
 
-# Runtime env & QoL
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONIOENCODING=UTF-8
-ENV HF_HOME=/root/.cache/huggingface
-ENV TORCH_HOME=/root/.cache/torch
-ENV HF_HUB_DISABLE_TELEMETRY=1
-ENV INSIGHTFACE_ONNX_PROVIDERS="CUDAExecutionProvider,CPUExecutionProvider"
-# Optional: mitigate CUDA memory fragmentation
-ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.7
-
-ENTRYPOINT ["python", "-m", "avatar_training_job.main"]
+ENTRYPOINT ["python3.11", "-m", "avatar_training_job.main"]
