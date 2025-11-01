@@ -26,7 +26,7 @@ gcloud ai custom-jobs create \
             },
             {
               "name": "INPUT_URI",
-              "value": "gs://billion-ai-girls-asia/jobs/fbe5afcb-4666-4933-b472-269ae858a597/generated.mp4"
+              "value": "gs://billion-ai-girls-asia/jobs/fbe5afcb-4666-4933-b472-269ae858a597/video1_interpolated.mp4"
             },
             {
               "name": "ESRGAN_WEIGHTS_URI",

@@ -39,12 +39,12 @@ ENV PATH="$VENV/bin:$PATH"
 # Base Python tooling
 RUN pip install --upgrade pip setuptools wheel packaging
 
-# ---------- Clone Wan2.2 ----------
-ARG WAN_REPO=https://github.com/Wan-Video/Wan2.2
 ARG WAN_DIR=/app/Wan2.2
-RUN git clone --depth=1 "$WAN_REPO" "$WAN_DIR"
+
+COPY Wan2.2 $WAN_DIR
+
 WORKDIR $WAN_DIR
-# If the repo uses LFS files, fetch them (won't hurt if none exist)
+
 RUN git lfs pull || true
 
 # ---------- Install All Dependencies in a Single Layer ----------
@@ -56,6 +56,9 @@ RUN pip install --index-url https://download.pytorch.org/whl/cu124 \
  && pip install google-cloud-storage==2.18.0 \
     huggingface-hub==0.30 \
     moviepy \
+    mediapipe \
+    opencv-python-headless \
+    controlnet_aux==0.0.7 \
  && pip install --upgrade diffusers \
  && pip uninstall -y onnxruntime onnxruntime-silicon \
  && pip install onnxruntime-gpu==1.19.0 --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/

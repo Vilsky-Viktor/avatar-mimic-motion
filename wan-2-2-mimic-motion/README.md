@@ -30,11 +30,11 @@ gcloud ai custom-jobs create \
             },
             {
               "name": "REF_IMAGE_PATH",
-              "value": "jobs/fbe5afcb-4666-4933-b472-269ae858a597/image-1-2.png"
+              "value": "jobs/fbe5afcb-4666-4933-b472-269ae858a597/image-1-1-full.png"
             },
             {
               "name": "REF_VIDEO_PATH",
-              "value": "jobs/fbe5afcb-4666-4933-b472-269ae858a597/video1.mp4"
+              "value": "jobs/fbe5afcb-4666-4933-b472-269ae858a597/video-1-slomo-upscaled.mp4"
             },
             {
               "name": "MODE",
@@ -47,6 +47,30 @@ gcloud ai custom-jobs create \
             {
               "name": "HEIGHT",
               "value": "1280"
+            },
+            {
+              "name": "SAMPLE_SOLVER",
+              "value": "unipc"
+            },
+            {
+              "name": "SAMPLING_STEPS",
+              "value": "20"
+            },
+            {
+              "name": "GUIDE_SCALE",
+              "value": "1.0"
+            },
+            {
+              "name": "SAMPLE_SHIFT",
+              "value": "5.0"
+            },
+            {
+              "name": "REFERT_NUM",
+              "value": "1"
+            },
+            {
+              "name": "OUTPUT_FOLDER_NAME",
+              "value": "output2"
             },
           ],
         }
